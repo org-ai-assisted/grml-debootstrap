@@ -32,6 +32,7 @@ Depends:
  ${shlibs:Depends},
 Recommends:
  dialog,
+ gdisk,
  kpartx,
  parted,
  qemu-utils,

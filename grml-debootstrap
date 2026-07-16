@@ -6,6 +6,10 @@
 # License:       This file is licensed under the GPL v2+
 ################################################################################
 # shellcheck disable=SC2001,SC2181
+## style-ok: no-strict -- upstream grml script; it uses a custom error_handler + trap (below)
+## instead of 'set -o errexit'/'set -o nounset'. Keep upstream style in this fork; do not impose
+## the org R-010 strict-mode block. (This waiver line is for the downstream style gate and can be
+## dropped if the change is submitted to grml-debootstrap upstream.)
 
 # error_handler {{{
 error_handler() {
@@ -1460,6 +1464,24 @@ prepare_vm() {
         # (amd64/x86_64)", see Discoverable Partitions Specification link above
         parted -s "${TARGET}" 'type 3 4f68bce3-e8cd-4db1-96e7-fbcaf984b709'
       fi
+    fi
+    if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
+      # parted assigns a RANDOM GPT disk GUID and random per-partition GUIDs (PARTUUIDs) on every
+      # run, which breaks reproducible images -- the msdos branch below already pins its MBR disk
+      # signature, and the root filesystem UUID is pinned in mkfs(), but the GPT identifiers were
+      # left random. Pin them to fixed, distinct values derived from $DISK_IDENTIFIER: keep its
+      # first 24 hex digits and encode the partition number in the trailing node field, so two
+      # builds produce byte-identical partition tables. Requires gdisk (sgdisk).
+      einfo "Setting GPT disk and partition GUIDs to fixed (non-random) values"
+      _gpt_prefix="${DISK_IDENTIFIER%????????????}" # $DISK_IDENTIFIER minus its 12-hex node field
+      sgdisk --disk-guid="${_gpt_prefix}000000000000" "${TARGET}" >/dev/null
+      sgdisk --partition-guid="1:${_gpt_prefix}000000000001" "${TARGET}" >/dev/null
+      sgdisk --partition-guid="2:${_gpt_prefix}000000000002" "${TARGET}" >/dev/null
+      if [ "$ARCH" != 'arm64' ]; then
+        # amd64 has an extra bios_grub partition, so root is partition 3.
+        sgdisk --partition-guid="3:${_gpt_prefix}000000000003" "${TARGET}" >/dev/null
+      fi
+      unset _gpt_prefix
     fi
   else
     parted -s "${TARGET}" 'mklabel msdos'
