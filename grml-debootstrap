@@ -1484,6 +1484,13 @@ prepare_image() {
     arm64)      [ -z "$RPI" ] && VMEFI=1;;
   esac
 
+  if [ -n "$VMEFI" ] && [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
+    # sgdisk (from gdisk) is needed to pin the GPT identifiers below. Check it here -- after
+    # the config file has been sourced and VMEFI is known -- rather than in the early
+    # check4progs, which runs before config sourcing.
+    check4progs sgdisk || bailout 1
+  fi
+
   parted_type_command_supported='no'
   if [[ "$(parted --help)" =~ 'type NUMBER TYPE-ID or TYPE-UUID' ]]; then
     parted_type_command_supported='yes'
@@ -1513,6 +1520,21 @@ prepare_image() {
         # Make the root partition identify itself as "Root Partition
         # (amd64/x86_64)", see Discoverable Partitions Specification link above
         parted -s "${TARGET}" 'type 3 4f68bce3-e8cd-4db1-96e7-fbcaf984b709'
+      fi
+    fi
+    if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
+      # parted assigns a random GPT disk GUID and random per-partition GUIDs (PARTUUIDs) on
+      # every run, which breaks reproducible images. Pin them to fixed, distinct values derived
+      # from $DISK_IDENTIFIER (its first 24 characters kept, the partition number encoded in the
+      # trailing node field), mirroring the MBR disk-signature handling in the msdos branch below.
+      einfo "Setting GPT disk and partition GUIDs to fixed (non-random) values"
+      gpt_guid_prefix="${DISK_IDENTIFIER%????????????}"
+      sgdisk --disk-guid="${gpt_guid_prefix}000000000000" "${TARGET}" >/dev/null
+      sgdisk --partition-guid="1:${gpt_guid_prefix}000000000001" "${TARGET}" >/dev/null
+      sgdisk --partition-guid="2:${gpt_guid_prefix}000000000002" "${TARGET}" >/dev/null
+      if [ "$ARCH" != 'arm64' ]; then
+        # amd64 has an extra bios_grub partition, so the root partition is number 3.
+        sgdisk --partition-guid="3:${gpt_guid_prefix}000000000003" "${TARGET}" >/dev/null
       fi
     fi
   elif [ -n "$RPI" ]; then
