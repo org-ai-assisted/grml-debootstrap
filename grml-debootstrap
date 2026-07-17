@@ -1462,6 +1462,10 @@ prepare_vm() {
       fi
     fi
     if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
+      # sgdisk (from gdisk) is required to pin the GPT identifiers below; bail out cleanly
+      # if it is missing (gdisk is only in Recommends) rather than aborting mid-partitioning
+      # under 'set -e', matching the check4progs guard on the other VM tools above.
+      check4progs sgdisk || bailout 1
       # parted assigns a random GPT disk GUID and random per-partition GUIDs (PARTUUIDs) on
       # every run, which breaks reproducible images. Pin them to fixed, distinct values derived
       # from $DISK_IDENTIFIER (its first 24 characters kept, the partition number encoded in the
