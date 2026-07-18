@@ -1650,11 +1650,17 @@ umount_target() {
     # kbytes_written); an 's_'-prefixed name is rejected before the filesystem is even opened.
     # wtime is re-stamped by debugfs on close and honours the exported SOURCE_DATE_EPOCH, so it
     # is pinned by any successful write; it is set explicitly here as well for clarity.
+    local debugfs_err
     for sde_cmd in "set_super_value mtime ${sde_hex}" \
                    "set_super_value wtime ${sde_hex}" \
                    "set_super_value lastcheck ${sde_hex}" \
                    "set_super_value kbytes_written 0" ; do
-      SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" debugfs -w -R "$sde_cmd" "$TARGET" >/dev/null 2>&1 || true
+      # debugfs exits 0 even when set_super_value fails internally (e.g. an unknown field on an older
+      # e2fsprogs), so inspect its stderr rather than the exit code and bail out on a real error.
+      debugfs_err="$(SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" debugfs -w -R "$sde_cmd" "$TARGET" 2>&1 1>/dev/null)"
+      case "$debugfs_err" in
+        *"set_super_value:"*) eerror "debugfs rejected '$sde_cmd' on ${TARGET}: ${debugfs_err}" ; bailout 1 ;;
+      esac
     done
     eend 0
   fi
