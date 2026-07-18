@@ -1256,6 +1256,16 @@ mkfs() {
         fi
         ;;
     esac
+
+    # Reproducible ext4 metadata. mke2fs otherwise generates a RANDOM directory hash seed and,
+    # with the metadata_csum_seed feature, a RANDOM checksum seed -- both stored in the superblock.
+    # The hash seed also determines htree directory ordering, so a random one reorders every indexed
+    # directory and cascades into different block allocation across the whole filesystem. When fixed
+    # disk identifiers are requested, pin the hash seed to the fixed UUID and drop metadata_csum_seed
+    # so the checksum seed follows the fixed filesystem UUID (set via tune2fs -U below).
+    if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
+      MKFS_OPTS="$MKFS_OPTS -E hash_seed=$DISK_IDENTIFIER -O ^metadata_csum_seed"
+    fi
   fi
 
   if [ -n "$MKFS" ] ; then
@@ -1570,6 +1580,27 @@ umount_target() {
   fi
 
   try_umount 3 "${MNTPOINT}"
+
+  # Reproducible ext4 superblock timestamps. While the root filesystem was mounted and populated,
+  # the kernel stamped its Last mount time (s_mtime) and Lifetime-writes counter (s_kbytes_written)
+  # with wall-clock values; mke2fs honours SOURCE_DATE_EPOCH for the creation time but nothing pins
+  # these post-mount fields, so the image differed every build. The root filesystem is now unmounted
+  # (fscktool is a no-op for VIRTUAL builds, so nothing writes it afterwards) while its partition
+  # mapping still exists, so pin the fields on the block device with debugfs. debugfs re-stamps the
+  # write time (s_wtime) itself on close and honours SOURCE_DATE_EPOCH for it, so exporting the epoch
+  # makes that deterministic too. Times are passed as hex because debugfs misparses large decimals.
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] && echo "$MKFS" | grep -q "mkfs.ext" ; then
+    einfo "Normalizing root filesystem superblock timestamps for reproducibility."
+    local sde_hex
+    sde_hex="$(printf '0x%x' "$SOURCE_DATE_EPOCH")"
+    for sde_cmd in "set_super_value s_mtime ${sde_hex}" \
+                   "set_super_value s_lastcheck ${sde_hex}" \
+                   "set_super_value s_kbytes_written 0" ; do
+      SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" debugfs -w -R "$sde_cmd" "$TARGET" >/dev/null 2>&1
+    done
+    eend $?
+  fi
+
   kpartx -d "${ORIG_TARGET}" >/dev/null
   # Workaround for a bug in kpartx which doesn't clean up properly,
   # see Debian Bug #891077 and Github-PR grml/grml-debootstrap#112
