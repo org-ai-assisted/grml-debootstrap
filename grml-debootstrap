@@ -1552,6 +1552,12 @@ umount_target() {
       [ -n "${esp_top}" ] && MTOOLS_SKIP_CHECK=1 mcopy -s -i "$EFI" "::/${esp_top}" "${esp_tmp_dir}/"
     done
     find "${esp_tmp_dir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+    # mkfs.fat rewrites only the FAT metadata and root directory, and mcopy writes only file
+    # contents -- neither zeroes the data region, so cluster slack (the unused tail of a file's
+    # last cluster) and free clusters keep stale bytes from the grub-install ESP, including old
+    # directory entries with the build's wall-clock FAT timestamps. Those bytes differ every build.
+    # Zero the whole partition first so all space the rebuild does not write is deterministic.
+    blkdiscard --zeroout "$EFI" 2>/dev/null || dd if=/dev/zero of="$EFI" bs=1M status=none 2>/dev/null || true
     mkfs.fat -F32 -n "EFI" "$EFI" >/dev/null
     # 'dotglob' so hidden top-level entries are copied back; 'nullglob' so an empty ESP does not
     # try to mcopy the literal '*'.
