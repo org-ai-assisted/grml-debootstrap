@@ -1781,6 +1781,7 @@ preparechroot() {
   [ -n "$TARGET" ]                    && echo "TARGET='${TARGET//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$UPGRADE_SYSTEM" ]            && echo "UPGRADE_SYSTEM='${UPGRADE_SYSTEM//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$TARGET_UUID" ]               && echo "TARGET_UUID='${TARGET_UUID//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
+  [ -n "${SOURCE_DATE_EPOCH:-}" ]     && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$TIMEZONE" ]                  && echo "TIMEZONE='${TIMEZONE//\'/\'\\\'\'}'"                                 >> "$CHROOT_VARIABLES"
   [ -n "$TUNE2FS" ]                   && echo "TUNE2FS='${TUNE2FS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$VMSIZE" ]                    && echo "VMSIZE='${VMSIZE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"

@@ -574,8 +574,16 @@ timezone() {
 # helper function for fstab() {{{
 createfstab(){
   echo "Setting up /etc/fstab"
+  # Honour SOURCE_DATE_EPOCH (reproducible builds) instead of the wall-clock date, so the fstab
+  # header comment is identical across builds. Falls back to date for normal usage.
+  local fstab_created_on
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] ; then
+    fstab_created_on="$(date -u -d "@${SOURCE_DATE_EPOCH}")"
+  else
+    fstab_created_on="$(date)"
+  fi
   cat > /etc/fstab <<EOF
-# /etc/fstab - created by grml-debootstrap on $(date)
+# /etc/fstab - created by grml-debootstrap on ${fstab_created_on}
 # Accessible filesystems, by reference, are maintained under '/dev/disk/'.
 # See man pages fstab(5), findfs(8), mount(8) and/or blkid(8) for more info.
 #
