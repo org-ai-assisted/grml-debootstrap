@@ -1535,6 +1535,28 @@ umount_target() {
 
   try_umount 3 "${MNTPOINT}"/boot/efi
 
+  # Reproducible EFI System Partition. grub-install populated the ESP FAT through a live kernel
+  # mount, and the vfat driver stamps each file's FAT directory entry (including a CREATE time that
+  # 'touch' cannot set) with the build's wall-clock time. SOURCE_DATE_EPOCH only affects mkfs.fat,
+  # not a live mount, so the ESP -- and thus any VM image built from this disk -- differs every
+  # build. When SOURCE_DATE_EPOCH is set, rebuild the ESP FAT deterministically with mtools:
+  # extract the tree, pin every mtime to SOURCE_DATE_EPOCH, re-mkfs, mcopy back preserving the time.
+  # No-op when SOURCE_DATE_EPOCH is unset (normal grml-debootstrap usage), so behaviour is unchanged.
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$EFI" ] && [ -b "$EFI" ] ; then
+    einfo "Rebuilding ESP FAT deterministically for reproducibility (SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH})."
+    esp_tmp_dir="$(mktemp -d)"
+    mdir -i "$EFI" -b ::/ 2>/dev/null | sed 's#^::/##; s#/$##' | while read -r esp_top ; do
+      [ -n "${esp_top}" ] && MTOOLS_SKIP_CHECK=1 mcopy -s -i "$EFI" "::/${esp_top}" "${esp_tmp_dir}/"
+    done
+    find "${esp_tmp_dir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+    mkfs.fat -F32 -n "EFI" "$EFI" >/dev/null
+    for esp_entry in "${esp_tmp_dir}"/* ; do
+      [ -e "${esp_entry}" ] && MTOOLS_SKIP_CHECK=1 mcopy -s -m -i "$EFI" "${esp_entry}" ::/
+    done
+    rm -rf "${esp_tmp_dir}"
+    eend $?
+  fi
+
   try_umount 3 "${MNTPOINT}"
   kpartx -d "${ORIG_TARGET}" >/dev/null
   # Workaround for a bug in kpartx which doesn't clean up properly,
