@@ -1584,6 +1584,56 @@ umount_target() {
 
   try_umount 3 "${MNTPOINT}"
 
+  # Reproducible ext4 block allocation. mkfs() created the root filesystem empty and it was then
+  # populated through a live mount, so the kernel's online block allocator placed files in
+  # debootstrap's (build-varying) unpack order -- the same files land on different blocks every
+  # build, defeating bit-for-bit reproducibility even though the file content is identical. Re-create
+  # the filesystem OFFLINE from a snapshot of the populated tree: mke2fs -d walks the source
+  # directory in alphabetical order and allocates deterministically, yielding an identical image
+  # every build. Runs only for VIRTUAL builds with SOURCE_DATE_EPOCH set; normal usage is unchanged.
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] && echo "$MKFS" | grep -q "mkfs.ext" ; then
+    einfo "Re-imaging root filesystem deterministically with mke2fs -d for reproducible block allocation."
+    local reimage_mnt reimage_tree reimage_parent reimage_uuid
+    reimage_mnt="$(mktemp -d)"
+    # Stage the copied tree on disk. Prefer the directory holding the image FILE: it has room for a
+    # full rootfs copy and is disk-backed. For a block-device target (--vm --target /dev/...) that
+    # directory would be a small RAM-backed devtmpfs, so fall back to TMPDIR there instead.
+    if [ -f "$ORIG_TARGET" ] ; then
+      reimage_parent="$(dirname "$ORIG_TARGET")"
+    else
+      reimage_parent="${TMPDIR:-/tmp}"
+    fi
+    reimage_tree="$(mktemp -d -p "$reimage_parent")"
+    # A fresh read-only mount of just the root partition exposes the on-disk tree with no pseudo
+    # filesystems (/proc, /sys, /dev) mounted over it to accidentally copy.
+    mount -o ro "$TARGET" "$reimage_mnt"
+    # cp -a preserves ownership, permissions, timestamps, symlinks, hardlinks, device nodes and
+    # xattrs (security.capability etc.) -- mke2fs -d relies on all of these being intact.
+    cp -a "$reimage_mnt/." "$reimage_tree/"
+    umount "$reimage_mnt"
+    rmdir "$reimage_mnt"
+    # Preserve the existing filesystem UUID: /etc/fstab and the bootloader were generated against
+    # it, so a new UUID would make the image unbootable. MKFS_OPTS only carries -U in the ext4 +
+    # FIXED_DISK_IDENTIFIERS case (ext2/ext3 get theirs from a separate tune2fs -U), so read the
+    # UUID from the populated filesystem and pass it explicitly -- the last -U on the command line
+    # wins, so this is a no-op when MKFS_OPTS already sets the same value.
+    reimage_uuid="$(blkid -o value -s UUID "$TARGET")"
+    # Reuse the exact MKFS_OPTS from mkfs() (hash_seed, ^metadata_csum_seed) so the geometry is
+    # identical; -d populates it deterministically and -F overwrites the existing filesystem. set -e
+    # aborts the build if this critical step fails rather than shipping a corrupt root filesystem.
+    # shellcheck disable=SC2086
+    SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "$MKFS" $MKFS_OPTS -U "$reimage_uuid" -d "$reimage_tree" -F "$TARGET"
+    rm -rf "$reimage_tree"
+    # Re-creating the filesystem also drops the periodic-fsck tuning the tunefs stage applied to the
+    # original mkfs, so re-apply it; the superblock timestamp normalization below re-pins any write
+    # time tune2fs stamps.
+    if [ -n "$TUNE2FS" ] ; then
+      # shellcheck disable=SC2086
+      $TUNE2FS "$TARGET" </dev/null
+    fi
+    eend 0
+  fi
+
   # Reproducible ext4 superblock timestamps. While the root filesystem was mounted and populated,
   # the kernel stamped its Last mount time (s_mtime) and Lifetime-writes counter (s_kbytes_written)
   # with wall-clock values; mke2fs honours SOURCE_DATE_EPOCH for the creation time but nothing pins
@@ -1596,12 +1646,17 @@ umount_target() {
     einfo "Normalizing root filesystem superblock timestamps for reproducibility."
     local sde_hex
     sde_hex="$(printf '0x%x' "$SOURCE_DATE_EPOCH")"
-    for sde_cmd in "set_super_value s_mtime ${sde_hex}" \
-                   "set_super_value s_lastcheck ${sde_hex}" \
-                   "set_super_value s_kbytes_written 0" ; do
-      SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" debugfs -w -R "$sde_cmd" "$TARGET" >/dev/null 2>&1
+    # debugfs set_super_value field names have NO 's_' prefix (mtime, wtime, lastcheck,
+    # kbytes_written); an 's_'-prefixed name is rejected before the filesystem is even opened.
+    # wtime is re-stamped by debugfs on close and honours the exported SOURCE_DATE_EPOCH, so it
+    # is pinned by any successful write; it is set explicitly here as well for clarity.
+    for sde_cmd in "set_super_value mtime ${sde_hex}" \
+                   "set_super_value wtime ${sde_hex}" \
+                   "set_super_value lastcheck ${sde_hex}" \
+                   "set_super_value kbytes_written 0" ; do
+      SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" debugfs -w -R "$sde_cmd" "$TARGET" >/dev/null 2>&1 || true
     done
-    eend $?
+    eend 0
   fi
 
   kpartx -d "${ORIG_TARGET}" >/dev/null
