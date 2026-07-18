@@ -1545,14 +1545,20 @@ umount_target() {
   if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$EFI" ] && [ -b "$EFI" ] ; then
     einfo "Rebuilding ESP FAT deterministically for reproducibility (SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH})."
     esp_tmp_dir="$(mktemp -d)"
-    mdir -i "$EFI" -b ::/ 2>/dev/null | sed 's#^::/##; s#/$##' | while read -r esp_top ; do
+    # '-a' so hidden/system entries at the ESP root are extracted too, and 'IFS= read -r' so a
+    # filename with leading/trailing spaces is not truncated -- this rebuild is destructive, so
+    # anything not extracted would be lost.
+    mdir -i "$EFI" -b -a ::/ 2>/dev/null | sed 's#^::/##; s#/$##' | while IFS= read -r esp_top ; do
       [ -n "${esp_top}" ] && MTOOLS_SKIP_CHECK=1 mcopy -s -i "$EFI" "::/${esp_top}" "${esp_tmp_dir}/"
     done
     find "${esp_tmp_dir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
     mkfs.fat -F32 -n "EFI" "$EFI" >/dev/null
-    for esp_entry in "${esp_tmp_dir}"/* ; do
-      [ -e "${esp_entry}" ] && MTOOLS_SKIP_CHECK=1 mcopy -s -m -i "$EFI" "${esp_entry}" ::/
-    done
+    # 'dotglob' so hidden top-level entries are copied back; 'nullglob' so an empty ESP does not
+    # try to mcopy the literal '*'.
+    ( shopt -s dotglob nullglob
+      for esp_entry in "${esp_tmp_dir}"/* ; do
+        MTOOLS_SKIP_CHECK=1 mcopy -s -m -i "$EFI" "${esp_entry}" ::/
+      done )
     rm -rf "${esp_tmp_dir}"
     eend $?
   fi
