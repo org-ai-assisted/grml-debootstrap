@@ -1267,7 +1267,13 @@ mkfs() {
     # the UUID afterwards would require re-seeding every metadata checksum, which tune2fs -U does not do
     # correctly -- leaving a filesystem the kernel refuses to mount ("can't read superblock").
     if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
-      MKFS_OPTS="$MKFS_OPTS -E hash_seed=$DISK_IDENTIFIER -O ^metadata_csum_seed -U $DISK_IDENTIFIER"
+        MKFS_OPTS="$MKFS_OPTS -E hash_seed=$DISK_IDENTIFIER -U $DISK_IDENTIFIER"
+        # Add -O ^metadata_csum_seed only when this mke2fs supports the feature; older mke2fs (< 1.43)
+        # rejects the unknown feature ("Invalid filesystem option set"), and there the checksum seed
+        # already follows the filesystem UUID by default, so nothing needs disabling.
+        if [ "$mkfs_supports_metadata_csum_seed" = 1 ] ; then
+          MKFS_OPTS="$MKFS_OPTS -O ^metadata_csum_seed"
+        fi
     fi
   fi
 
