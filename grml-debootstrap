@@ -1262,9 +1262,12 @@ mkfs() {
     # The hash seed also determines htree directory ordering, so a random one reorders every indexed
     # directory and cascades into different block allocation across the whole filesystem. When fixed
     # disk identifiers are requested, pin the hash seed to the fixed UUID and drop metadata_csum_seed
-    # so the checksum seed follows the fixed filesystem UUID (set via tune2fs -U below).
+    # so the checksum seed follows the filesystem UUID. That UUID must be set HERE, at mkfs time (-U),
+    # not only via the tune2fs -U below: without metadata_csum_seed the seed IS the UUID, and changing
+    # the UUID afterwards would require re-seeding every metadata checksum, which tune2fs -U does not do
+    # correctly -- leaving a filesystem the kernel refuses to mount ("can't read superblock").
     if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
-      MKFS_OPTS="$MKFS_OPTS -E hash_seed=$DISK_IDENTIFIER -O ^metadata_csum_seed"
+      MKFS_OPTS="$MKFS_OPTS -E hash_seed=$DISK_IDENTIFIER -O ^metadata_csum_seed -U $DISK_IDENTIFIER"
     fi
   fi
 
