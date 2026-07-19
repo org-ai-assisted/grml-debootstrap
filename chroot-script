@@ -578,7 +578,7 @@ createfstab(){
   # header comment is identical across builds. Falls back to date for normal usage.
   local fstab_created_on
   if [ -n "${SOURCE_DATE_EPOCH:-}" ] ; then
-    fstab_created_on="$(date -u -d "@${SOURCE_DATE_EPOCH}")"
+    fstab_created_on="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}")"
   else
     fstab_created_on="$(date)"
   fi
