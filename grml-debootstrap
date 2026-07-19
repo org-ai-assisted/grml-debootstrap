@@ -1753,6 +1753,9 @@ preparechroot() {
   chmod 600 "$CHROOT_VARIABLES" # make sure nobody except root can read it
   echo "# Configuration of ${PN}"                                                                                   > "$CHROOT_VARIABLES"
   [ -n "$ARCH" ]                      && echo "ARCH='${ARCH//\'/\'\\\'\'}'"                                         >> "$CHROOT_VARIABLES"
+  # propagate DPKG_OPTIONS (e.g. -o Acquire::Check-Valid-Until=false for frozen snapshot builds)
+  # into the chroot so chroot-script's 'apt-get update $DPKG_OPTIONS' honors it
+  [ -n "${DPKG_OPTIONS:-}" ]          && echo "DPKG_OPTIONS='${DPKG_OPTIONS//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$BACKPORTREPOS" ]             && echo "BACKPORTREPOS='${BACKPORTREPOS//\'/\'\\\'\'}'"                       >> "$CHROOT_VARIABLES"
   [ -n "$BOOT_APPEND" ]               && echo "BOOT_APPEND='${BOOT_APPEND//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
   [ -n "$CHROOT_SCRIPTS" ]            && echo "CHROOT_SCRIPTS='${CHROOT_SCRIPTS//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
