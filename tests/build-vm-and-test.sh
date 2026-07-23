@@ -49,9 +49,16 @@ if [ "$1" == "setup" ]; then
   if [ ! -x ./tests/goss ]; then
     goss_ver='v0.4.9'
     goss_arch="$(dpkg --print-architecture)"
-    goss_url="https://github.com/goss-org/goss/releases/download/${goss_ver}/goss-linux-${goss_arch}"
-    curl -fsSL -o ./tests/goss "${goss_url}"
-    goss_sha="$(curl -fsSL "${goss_url}.sha256" | awk '{print $1}')"
+    # Pinned, reviewed sha256 per architecture. Do NOT fetch the checksum from the
+    # same release -- a tampered release could replace both the binary and its
+    # published .sha256 and still pass the check.
+    case "$goss_arch" in
+      amd64) goss_sha='87dd36cfa1b8b50554e6e2ca29168272e26755b19ba5438341f7c66b36decc19' ;;
+      arm64) goss_sha='14fd24ac08236559f4809e6a627792d1b947ed98654bba1662ef1d6122d77e18' ;;
+      *) echo "$0: no pinned goss checksum for architecture '$goss_arch'" >&2 ; exit 1 ;;
+    esac
+    curl -fsSL -o ./tests/goss \
+      "https://github.com/goss-org/goss/releases/download/${goss_ver}/goss-linux-${goss_arch}"
     echo "${goss_sha}  ./tests/goss" | sha256sum -c -
     chmod +x ./tests/goss
   fi

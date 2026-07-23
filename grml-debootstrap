@@ -1638,7 +1638,7 @@ make_esp_reproducible() {
   # FAT directory entry with the wall-clock time (including a create time that
   # touch cannot set); SOURCE_DATE_EPOCH only affects mkfs.fat, not a live mount.
   # Extract the tree, pin its mtimes, zero the partition, re-mkfs and copy back.
-  local esp_tmp_dir esp_top esp_entry
+  local esp_tmp_dir esp_top esp_entry esp_bytes
   local esp_tops=()
   einfo "Making the ESP reproducible"
   esp_tmp_dir="$(mktemp -d)"
@@ -1653,11 +1653,22 @@ make_esp_reproducible() {
       || { eerror "Failed to extract ESP entry '${esp_top}'"; bailout 1; }
   done
   find "${esp_tmp_dir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+  # A grub-install-populated ESP is never empty; if the extraction captured nothing
+  # (mdir failed or listed nothing), refuse to wipe it -- otherwise the rebuild
+  # would ship an empty, unbootable ESP with no error.
+  if [ -z "$(ls -A "${esp_tmp_dir}")" ]; then
+    eerror "ESP extraction from ${EFI_TARGET} produced no files; refusing to wipe it"
+    bailout 1
+  fi
   # mkfs.fat and mcopy write only metadata and file contents, so cluster slack and
   # free clusters keep stale timestamped bytes; zero the partition first. Failing to
   # zero reintroduces the non-determinism this step exists to remove, so bail out.
+  # The dd fallback is sized to the partition (count); an unsized 'dd ... /dev/zero'
+  # writes until ENOSPC and exits non-zero on a SUCCESSFUL full-device zero, which
+  # would falsely trip the bailout below. ESP partitions are MiB-aligned (parted).
+  esp_bytes="$(blockdev --getsize64 "${EFI_TARGET}")"
   blkdiscard --zeroout "${EFI_TARGET}" 2>/dev/null \
-    || dd if=/dev/zero of="${EFI_TARGET}" bs=1M status=none 2>/dev/null \
+    || dd if=/dev/zero of="${EFI_TARGET}" bs=1M count="$(( esp_bytes / 1048576 ))" status=none 2>/dev/null \
     || { eerror "Failed to zero ${EFI_TARGET} before rebuilding the ESP"; bailout 1; }
   mkfs.fat -F32 -n "EFI" "${EFI_TARGET}" >/dev/null
   # dotglob copies hidden top-level entries back; nullglob avoids a literal '*' on
