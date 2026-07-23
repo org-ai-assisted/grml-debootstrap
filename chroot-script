@@ -920,15 +920,18 @@ reproducible_finalize() {
 
   # Per-install secrets are random (SSH host keys) or embed a build timestamp
   # (aliases.db), so they differ every build; remove them so they are not baked
-  # into the image. No custom regeneration machinery is needed: emptying
-  # /etc/machine-id makes systemd treat the next boot as the first boot
-  # (ConditionFirstBoot=yes), which triggers Debian's own, already-enabled
-  # sshd-keygen.service (ExecStart=ssh-keygen -A, ordered Before=ssh.service) to
-  # regenerate the host keys, so sshd still starts. The default /etc/aliases is
-  # bare, so aliases.db needs no rebuild.
+  # into the image. No custom regeneration machinery is needed: making the next
+  # boot systemd's "first boot" (ConditionFirstBoot=yes) triggers Debian's own,
+  # already-enabled sshd-keygen.service (ExecStart=ssh-keygen -A, ordered
+  # Before=ssh.service) to regenerate the host keys, so sshd still starts. The
+  # default /etc/aliases is bare, so aliases.db needs no rebuild.
   rm -f /etc/ssh/ssh_host_*
   rm -f /etc/aliases.db
-  : > /etc/machine-id            # empty => first-boot => sshd-keygen.service runs
+  # ConditionFirstBoot needs /etc/machine-id to be absent or the literal
+  # "uninitialized"; an EMPTY file does NOT trigger it (systemd just commits a
+  # transient id and firstboot stays false, so sshd-keygen is skipped and sshd
+  # fails with no host keys). "uninitialized" is deterministic, so reproducible.
+  printf 'uninitialized\n' > /etc/machine-id
   rm -f /var/lib/dbus/machine-id # bind-remounted from /etc/machine-id on boot
 
   # Build-time logs and regenerable caches carry wall-clock timestamps or
