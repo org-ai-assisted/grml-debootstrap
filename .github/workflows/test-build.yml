@@ -25,6 +25,11 @@ jobs:
     # We want a working shell, qemu, python and docker. Specific version should not matter (much).
     runs-on: ubuntu-latest
 
+    # debian:unstable (sid) is a moving target whose build deps periodically
+    # conflict; tolerate its failure so it does not fail the whole job and block
+    # the dependent functional test-debian job (needs: build-debian).
+    continue-on-error: ${{ matrix.host_release == 'unstable' }}
+
     steps:
     - uses: actions/checkout@v7
 
@@ -75,6 +80,11 @@ jobs:
 
     # We want a working shell, qemu, python and docker. Specific version should not matter (much).
     runs-on: ${{ matrix.runner }}
+
+    # The unstable host build is allowed to fail (above), so its .deb artifact may
+    # be missing; tolerate the resulting unstable test legs rather than failing the
+    # workflow. The trixie/bookworm functional (goss) tests still gate.
+    continue-on-error: ${{ matrix.host_release == 'unstable' }}
 
     steps:
     - uses: actions/checkout@v7
