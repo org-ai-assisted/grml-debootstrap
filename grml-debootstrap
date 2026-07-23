@@ -1639,25 +1639,37 @@ make_esp_reproducible() {
   # touch cannot set); SOURCE_DATE_EPOCH only affects mkfs.fat, not a live mount.
   # Extract the tree, pin its mtimes, zero the partition, re-mkfs and copy back.
   local esp_tmp_dir esp_top esp_entry
+  local esp_tops=()
   einfo "Making the ESP reproducible"
   esp_tmp_dir="$(mktemp -d)"
-  # -a extracts hidden/system root entries too; IFS= read -r keeps odd names
-  # intact - this rebuild is destructive, so anything not extracted is lost.
-  mdir -i "${EFI_TARGET}" -b -a ::/ 2>/dev/null | sed 's#^::/##; s#/$##' \
-    | while IFS= read -r esp_top; do
-    [ -n "${esp_top}" ] && MTOOLS_SKIP_CHECK=1 \
-      mcopy -s -i "${EFI_TARGET}" "::/${esp_top}" "${esp_tmp_dir}/"
+  # -a lists hidden/system root entries too. Read the listing into an array rather
+  # than piping into a while loop, so a failure below can bailout the whole build
+  # (a pipe-to-while runs in a subshell where bailout could not); this rebuild is
+  # destructive, so a silently dropped file would be lost from the ESP for good.
+  readarray -t esp_tops < <(mdir -i "${EFI_TARGET}" -b -a ::/ 2>/dev/null | sed 's#^::/##; s#/$##')
+  for esp_top in "${esp_tops[@]}"; do
+    [ -n "${esp_top}" ] || continue
+    MTOOLS_SKIP_CHECK=1 mcopy -s -i "${EFI_TARGET}" "::/${esp_top}" "${esp_tmp_dir}/" \
+      || { eerror "Failed to extract ESP entry '${esp_top}'"; bailout 1; }
   done
   find "${esp_tmp_dir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
-  # mkfs.fat and mcopy write only metadata and file contents, so cluster slack
-  # and free clusters keep stale timestamped bytes; zero the partition first.
+  # mkfs.fat and mcopy write only metadata and file contents, so cluster slack and
+  # free clusters keep stale timestamped bytes; zero the partition first. Failing to
+  # zero reintroduces the non-determinism this step exists to remove, so bail out.
   blkdiscard --zeroout "${EFI_TARGET}" 2>/dev/null \
-    || dd if=/dev/zero of="${EFI_TARGET}" bs=1M status=none 2>/dev/null || true
+    || dd if=/dev/zero of="${EFI_TARGET}" bs=1M status=none 2>/dev/null \
+    || { eerror "Failed to zero ${EFI_TARGET} before rebuilding the ESP"; bailout 1; }
   mkfs.fat -F32 -n "EFI" "${EFI_TARGET}" >/dev/null
-  ( shopt -s dotglob nullglob
-    for esp_entry in "${esp_tmp_dir}"/*; do
-      MTOOLS_SKIP_CHECK=1 mcopy -s -m -i "${EFI_TARGET}" "${esp_entry}" ::/
-    done )
+  # dotglob copies hidden top-level entries back; nullglob avoids a literal '*' on
+  # an empty ESP. The subshell scopes the shopt; check its status and bail on a
+  # failed mcopy instead of silently shipping an incomplete ESP.
+  if ! ( shopt -s dotglob nullglob
+         for esp_entry in "${esp_tmp_dir}"/*; do
+           MTOOLS_SKIP_CHECK=1 mcopy -s -m -i "${EFI_TARGET}" "${esp_entry}" ::/ || exit 1
+         done ); then
+    eerror "Failed to restore an entry into the rebuilt ESP"
+    bailout 1
+  fi
   rm -rf "${esp_tmp_dir}"
 }
 # }}}

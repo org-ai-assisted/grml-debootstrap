@@ -65,7 +65,13 @@ report='reproducible-report.txt'
   echo
   echo '=== first differing byte (cmp) ==='
   cmp "$img_a" "$img_b" || true
-  echo "differing byte count: $(cmp -l "$img_a" "$img_b" 2>/dev/null | wc -l)"
+  # Cap the byte enumeration: on a broad regression cmp -l would emit one line per
+  # differing byte across multi-GB images (billions of lines, hours). head closes
+  # the pipe early, so cmp stops at the cap.
+  cap=100000
+  n="$(cmp -l "$img_a" "$img_b" 2>/dev/null | head -n "$cap" | wc -l)"
+  [ "$n" -ge "$cap" ] && echo "differing byte count: >= ${cap} (capped)" \
+                      || echo "differing byte count: ${n}"
   echo
   echo '=== partition table diff (sfdisk -d) ==='
   diff <(sfdisk -d "$img_a" 2>/dev/null) <(sfdisk -d "$img_b" 2>/dev/null) || true
@@ -97,7 +103,14 @@ if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; t
       | while IFS='|' read -r fa fb; do
           echo "--- ${fa#"$mnt_a"} ($(sudo stat -c%s "$fa" 2>/dev/null) bytes) ---"
           sudo cmp -l "$fa" "$fb" 2>&1 | head -20
-          sudo diff <(sudo strings "$fa") <(sudo strings "$fb") 2>&1 | head -30
+          # Readable-string delta. Use temp files, not process substitution: a
+          # sudo'd diff cannot open the caller's /dev/fd/NN. sudo is only needed to
+          # READ the root-owned image files; the redirect target is user-writable.
+          # shellcheck disable=SC2024
+          sudo strings "$fa" > /tmp/repro_sa.txt 2>/dev/null
+          # shellcheck disable=SC2024
+          sudo strings "$fb" > /tmp/repro_sb.txt 2>/dev/null
+          diff /tmp/repro_sa.txt /tmp/repro_sb.txt 2>&1 | head -30
         done
   } >> "$report" 2>&1
   sudo umount "$mnt_a" "$mnt_b" || true
