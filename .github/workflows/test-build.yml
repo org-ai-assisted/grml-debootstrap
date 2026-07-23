@@ -101,6 +101,15 @@ jobs:
             runner: ubuntu-latest
             target: VM
             reproducible: 'yes'
+          # The amd64 VM is BIOS (no ESP), so the leg above never exercises the
+          # ESP-reproducibility path. arm64 VM is UEFI (VMEFI=1 -> a real ESP),
+          # so this leg additionally proves make_esp_reproducible and the GPT
+          # disk-identifier determinism, and that the stripped arm64 image boots.
+          - host_release: trixie
+            release: trixie
+            runner: ubuntu-24.04-arm
+            target: VM
+            reproducible: 'yes'
 
     # We want a working shell, qemu, python and docker. Specific version should not matter (much).
     runs-on: ${{ matrix.runner }}
@@ -163,8 +172,18 @@ jobs:
     # gate. Reuses build-debian's deb-trixie artifact (no duplicate .deb build) and
     # the same build-vm-and-test.sh image-build path, so this is the only genuinely
     # new job. A difference uploads a diffoscope-style report.
+    #
+    # Run it on BOTH architectures: amd64 proves the BIOS/msdos + ext4 path, arm64
+    # proves the UEFI GPT+ESP path (make_esp_reproducible). The grml-debootstrap
+    # .deb is Architecture:all, so both reuse the same deb-trixie artifact.
     needs: build-debian
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+        - ubuntu-latest
+        - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
     - uses: actions/checkout@v7
       with:
@@ -186,7 +205,7 @@ jobs:
       uses: actions/upload-artifact@v7
       if: failure()
       with:
-        name: reproducible-report
+        name: reproducible-report-${{ matrix.runner }}
         path: reproducible-report.txt
         if-no-files-found: warn
         retention-days: 14

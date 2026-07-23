@@ -31,6 +31,16 @@ if [ ! -d ./tests ]; then
   exit 1
 fi
 
+# A SOURCE_DATE_EPOCH exported as an EMPTY string breaks tools that read it:
+# dosfstools' mkfs.fat rejects "" ("SOURCE_DATE_EPOCH is too big or contains
+# non-digits") and aborts ESP creation, so every EFI/arm64 VM and RPI leg fails,
+# while mke2fs treats "" as unset and masks the problem on amd64 BIOS VMs. The
+# reproducible-builds convention is unset-or-valid-integer, never empty, so a
+# non-reproducible leg must UNSET it rather than pass an empty value through.
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+  unset SOURCE_DATE_EPOCH
+fi
+
 if [ "$1" == "setup" ]; then
   sudo apt-get update
   sudo apt-get -qq -y install curl kpartx python3-serial
