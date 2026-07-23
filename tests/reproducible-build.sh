@@ -50,6 +50,10 @@ fi
 
 echo 'RESULT: images DIFFER -- not reproducible. Localizing the difference.' >&2
 
+# Diagnostics only from here: diff/cmp exit non-zero on an expected difference, so do not let
+# errexit abort before the report is written.
+set +e
+
 # The raw images are multi-GB, so diffoscope over them is impractical; instead pinpoint the
 # difference structurally: the raw byte offset, the partition table, then -- most usefully -- the
 # root filesystem's file contents and mtimes (the latter is the usual remaining reproducibility
@@ -78,7 +82,10 @@ if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; t
   {
     echo
     echo '=== root filesystem: file content differences (diff -qr) ==='
-    sudo diff -qr "$mnt_a" "$mnt_b" 2>&1 | head -200
+    # --no-dereference compares symlinks as symlinks; without it diff follows an
+    # absolute symlink (e.g. /etc/ssl/certs/*.pem) out of the mount and floods the
+    # report with spurious "No such file" lines.
+    sudo diff -qr --no-dereference "$mnt_a" "$mnt_b" 2>&1 | head -200
     echo
     echo '=== root filesystem: file mtime differences (epoch path) ==='
     diff <(cd "$mnt_a" && sudo find . -printf '%T@ %p\n' | sort -k2) \
