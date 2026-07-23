@@ -11,6 +11,11 @@ on:
 concurrency:
   group: "${{ github.ref }}"
   cancel-in-progress: true
+
+# Least privilege: every job only reads the repo and uses the artifact backend.
+permissions:
+  contents: read
+
 jobs:
   build-debian:
     strategy:
@@ -27,11 +32,13 @@ jobs:
 
     # debian:unstable (sid) is a moving target whose build deps periodically
     # conflict; tolerate its failure so it does not fail the whole job and block
-    # the dependent functional test-debian job (needs: build-debian).
+    # the dependent test-debian / reproducible-compare jobs (needs: build-debian).
     continue-on-error: ${{ matrix.host_release == 'unstable' }}
 
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - run: ./tests/gha-build-deb.sh
       name: "Build .deb for ${{matrix.host_release}}"
@@ -70,6 +77,10 @@ jobs:
         - VM
         - RPI
 
+        # Every base combination is a normal (non-reproducible) build.
+        reproducible:
+        - 'no'
+
         exclude:
           # don't try to do raspi tests on amd64
           - runner: ubuntu-latest
@@ -77,6 +88,19 @@ jobs:
           # don't do raspi tests on <= bookworm hosts, needs at least QEMU 9.x
           - host_release: bookworm
             target: RPI
+
+        include:
+          # One extra leg builds the image in REPRODUCIBLE mode (SOURCE_DATE_EPOCH +
+          # FIXED_DISK_IDENTIFIERS, so reproducible_finalize strips the per-install
+          # secrets) and boot-tests it -- proving the stripped image still comes up
+          # with a working sshd (host keys regenerated on first boot by Debian's
+          # sshd-keygen.service, triggered by the emptied /etc/machine-id). Reuses the
+          # exact build+boot+goss path, so it is not a duplicate job.
+          - host_release: trixie
+            release: trixie
+            runner: ubuntu-latest
+            target: VM
+            reproducible: 'yes'
 
     # We want a working shell, qemu, python and docker. Specific version should not matter (much).
     runs-on: ${{ matrix.runner }}
@@ -88,6 +112,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Download built deb
       uses: actions/download-artifact@v8
@@ -98,11 +124,15 @@ jobs:
       name: "Setup test environment"
 
     - run: ./tests/build-vm-and-test.sh run
-      name: "Build ${{matrix.target}} image using grml-debootstrap on host ${{matrix.host_release}} for ${{matrix.release}}"
+      name: "Build ${{matrix.target}} image (host ${{matrix.host_release}}, ${{matrix.release}}, reproducible=${{matrix.reproducible}})"
       env:
         HOST_RELEASE: ${{matrix.host_release}}
         RELEASE: ${{matrix.release}}
         TARGET: ${{matrix.target}}
+        # Reproducible-mode leg only: deterministic timestamps + identifiers, which
+        # trigger reproducible_finalize (secret stripping). Empty (inert) otherwise.
+        SOURCE_DATE_EPOCH: ${{ matrix.reproducible == 'yes' && '1767225600' || '' }}
+        FIXED_DISK_IDENTIFIERS: ${{ matrix.reproducible == 'yes' && 'yes' || '' }}
 
     - run: ./tests/build-vm-and-test.sh test
       id: build_vm_and_test_test
@@ -115,7 +145,7 @@ jobs:
       uses: actions/upload-artifact@v7
       if: always() && (steps.build_vm_and_test_test.outcome == 'failure')
       with:
-        name: vm-image-${{matrix.host_release}}-${{matrix.release}}-${{matrix.runner}}-${{matrix.target}}
+        name: vm-image-${{matrix.host_release}}-${{matrix.release}}-${{matrix.runner}}-${{matrix.target}}-repro-${{matrix.reproducible}}
         if-no-files-found: error
         path: qemu.img
         retention-days: 5
@@ -124,6 +154,39 @@ jobs:
       uses: actions/upload-artifact@v7
       if: always()
       with:
-        name: vm-results-${{matrix.host_release}}-${{matrix.release}}-${{matrix.runner}}-${{matrix.target}}
+        name: vm-results-${{matrix.host_release}}-${{matrix.release}}-${{matrix.runner}}-${{matrix.target}}-repro-${{matrix.reproducible}}
         if-no-files-found: error
         path: tests/results/
+
+  reproducible-compare:
+    # Build the SAME image twice and compare byte-for-byte -- the reproducibility
+    # gate. Reuses build-debian's deb-trixie artifact (no duplicate .deb build) and
+    # the same build-vm-and-test.sh image-build path, so this is the only genuinely
+    # new job. A difference uploads a diffoscope-style report.
+    needs: build-debian
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Download built deb
+      uses: actions/download-artifact@v8
+      with:
+        name: deb-trixie
+
+    - run: ./tests/reproducible-build.sh
+      name: "Build the VM image twice and compare (SOURCE_DATE_EPOCH + FIXED_DISK_IDENTIFIERS)"
+      env:
+        HOST_RELEASE: trixie
+        RELEASE: trixie
+        TARGET: VM
+
+    - name: Archive difference report on failure
+      uses: actions/upload-artifact@v7
+      if: failure()
+      with:
+        name: reproducible-report
+        path: reproducible-report.txt
+        if-no-files-found: warn
+        retention-days: 14
