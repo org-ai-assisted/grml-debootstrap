@@ -90,6 +90,15 @@ if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; t
     echo '=== root filesystem: file mtime differences (epoch path) ==='
     diff <(cd "$mnt_a" && sudo find . -printf '%T@ %p\n' | sort -k2) \
          <(cd "$mnt_b" && sudo find . -printf '%T@ %p\n' | sort -k2) | head -200
+    echo
+    echo '=== content of each differing file (byte offsets + readable strings) ==='
+    sudo diff -qr --no-dereference "$mnt_a" "$mnt_b" 2>/dev/null \
+      | sed -n 's/^Files \(.*\) and \(.*\) differ$/\1|\2/p' \
+      | while IFS='|' read -r fa fb; do
+          echo "--- ${fa#"$mnt_a"} ($(sudo stat -c%s "$fa" 2>/dev/null) bytes) ---"
+          sudo cmp -l "$fa" "$fb" 2>&1 | head -20
+          sudo diff <(sudo strings "$fa") <(sudo strings "$fb") 2>&1 | head -30
+        done
   } >> "$report" 2>&1
   sudo umount "$mnt_a" "$mnt_b" || true
 fi
