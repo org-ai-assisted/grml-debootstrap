@@ -33,6 +33,10 @@ bash -n /etc/debootstrap/variables
 # shellcheck source=tests/shellcheck-stub-debootstrap-variables
 . /etc/debootstrap/variables || exit 1
 
+# Export SOURCE_DATE_EPOCH so every child process honours it (mkinitramfs, dpkg,
+# and other SOURCE_DATE_EPOCH-aware tools) -- required for a reproducible image.
+[ -n "${SOURCE_DATE_EPOCH:-}" ] && export SOURCE_DATE_EPOCH
+
 [ -r /proc/1 ] || mount -t proc none /proc
 [ -r /sys/kernel ] || mount -t sysfs none /sys
 
@@ -411,8 +415,18 @@ passwords()
   fi
 
   if [ -n "$ROOTPASSWORD" ] ; then
-     # shellcheck disable=SC2086
-     echo root:"$ROOTPASSWORD" | chpasswd $CHPASSWD_OPTION
+     if [ -n "${SOURCE_DATE_EPOCH:-}" ] ; then
+       # Reproducible builds: chpasswd would pick a random salt, so /etc/shadow
+       # would differ every build. Hash with a fixed salt derived from
+       # SOURCE_DATE_EPOCH (perl's crypt uses the system crypt(); perl-base is
+       # Essential) and set the pre-encrypted hash.
+       repro_salt="$(printf '%s' "$SOURCE_DATE_EPOCH" | sha256sum | cut -c1-16)"
+       repro_hash="$(perl -e 'print crypt($ARGV[0], "\$6\$".$ARGV[1]."\$")' "$ROOTPASSWORD" "$repro_salt")"
+       echo "root:$repro_hash" | chpasswd -e
+     else
+       # shellcheck disable=SC2086
+       echo root:"$ROOTPASSWORD" | chpasswd $CHPASSWD_OPTION
+     fi
      export ROOTPASSWORD=''
   else
     a='1'
@@ -898,6 +912,19 @@ finalize() {
 }
 # }}}
 
+# reproducible-build finalization {{{
+# shellcheck disable=SC2329
+reproducible_finalize() {
+  [ -n "${SOURCE_DATE_EPOCH:-}" ] || return 0
+  echo "Applying reproducible-build finalization (stripping per-install secrets)."
+  # Per-install secrets must not be baked into a reproducible image; they are
+  # regenerated on first boot, so two builds no longer differ on them.
+  rm -f /etc/ssh/ssh_host_*      # openssh regenerates these on first boot
+  : > /etc/machine-id            # systemd regenerates it on first boot
+  rm -f /var/lib/dbus/machine-id # bind-remounted from /etc/machine-id on boot
+}
+# }}}
+
 # signal handler {{{
 # shellcheck disable=SC2329
 signal_handler() {
@@ -921,7 +948,7 @@ trap signal_handler HUP INT QUIT TERM
      default_locales timezone fstab install_fs_tools hostname \
      initrd grub_install passwords \
      custom_scripts upgrade_system rpi_cmdline remove_apt_cache services \
-     remove_chrootmirror; do
+     remove_chrootmirror reproducible_finalize; do
      if stage "$i" ; then
        "$i"
        stage "$i" 'done'
