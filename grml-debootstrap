@@ -1681,7 +1681,7 @@ make_esp_reproducible() {
 # the same device avoids a 'device already mounted' failure.
 reimage_tree=''
 snapshot_root_filesystem() {
-  local reimage_parent
+  local reimage_parent src reimage_mnt
   einfo "Snapshotting the root filesystem for a reproducible re-image"
   # Stage the copied tree on the disk-backed directory holding the image file; a
   # block-device target has only a small RAM-backed devtmpfs there, so use TMPDIR.
@@ -1691,10 +1691,21 @@ snapshot_root_filesystem() {
     reimage_parent="${TMPDIR:-/tmp}"
   fi
   reimage_tree="$(mktemp -d -p "${reimage_parent}")"
-  # Copy from the still-mounted MNTPOINT. --one-file-system stays on the root fs, so
-  # any pseudo-filesystems still mounted under it (/proc, /sys, /dev) are not
-  # descended into; cp -a preserves everything mke2fs -d relies on.
-  cp -a --one-file-system "${MNTPOINT}/." "${reimage_tree}/"
+  # Locate where the root device is actually mounted right now (which path it is on
+  # by this point is environment-dependent, so do not assume MNTPOINT) and copy from
+  # that live mount with --one-file-system, so pseudo-filesystems still mounted under
+  # it (/proc, /sys, /dev) are not descended into. If it is already unmounted, fall
+  # back to a fresh read-only mount. cp -a preserves everything mke2fs -d relies on.
+  src="$(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null | head -1 || true)"
+  if [ -n "${src}" ]; then
+    cp -a --one-file-system "${src}/." "${reimage_tree}/"
+  else
+    reimage_mnt="$(mktemp -d)"
+    mount -o ro "${TARGET}" "${reimage_mnt}"
+    cp -a "${reimage_mnt}/." "${reimage_tree}/"
+    umount "${reimage_mnt}"
+    rmdir "${reimage_mnt}"
+  fi
 }
 # }}}
 
@@ -1704,9 +1715,18 @@ reimage_root_filesystem() {
   # placed files in debootstrap's (build-varying) unpack order. Re-create the
   # filesystem offline with mke2fs -d, which allocates in a deterministic
   # alphabetical order, yielding an identical image every build.
-  local reimage_uuid
+  local reimage_uuid mp tries
   [ -n "${reimage_tree}" ] && [ -d "${reimage_tree}" ] || return 0
   einfo "Re-imaging the root filesystem for reproducible block allocation"
+  # mke2fs -F overwrites the device, so ensure nothing still has it mounted (the
+  # earlier unmount may have been lazy, or it may be mounted at more than one path).
+  tries=0
+  while mp="$(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null | head -1)"; \
+        [ -n "${mp}" ] && [ "${tries}" -lt 10 ]; do
+    umount "${mp}" 2>/dev/null || umount -l "${mp}" 2>/dev/null || true
+    tries=$((tries + 1))
+    sleep 1
+  done
   # Preserve the existing UUID (fstab and bootloader reference it); the last -U
   # wins, so this is a no-op when MKFS_OPTS already sets the same value.
   reimage_uuid="$(blkid -o value -s UUID "${TARGET}")"
