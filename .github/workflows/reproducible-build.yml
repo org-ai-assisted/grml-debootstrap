@@ -73,3 +73,52 @@ jobs:
           path: reproducible-report.txt
           if-no-files-found: warn
           retention-days: 14
+
+  # Prove the reproducible image (built with the stripped per-install secrets) is
+  # still FUNCTIONAL: build one image in reproducible mode, boot it under qemu and
+  # run goss, which asserts sshd is running. This exercises the key-stripping path
+  # end to end -- the removed SSH host keys must be regenerated on first boot by
+  # Debian's sshd-keygen.service (triggered by the emptied /etc/machine-id).
+  functional-reproducible:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download built deb
+        uses: actions/download-artifact@v8
+        with:
+          name: deb-trixie
+
+      - run: ./tests/build-vm-and-test.sh setup
+        name: "Setup test environment"
+
+      - run: ./tests/build-vm-and-test.sh run
+        name: "Build a REPRODUCIBLE VM image (SOURCE_DATE_EPOCH + stripped secrets)"
+        env:
+          HOST_RELEASE: trixie
+          RELEASE: trixie
+          TARGET: VM
+          SOURCE_DATE_EPOCH: "1767225600"
+          FIXED_DISK_IDENTIFIERS: "yes"
+
+      - run: ./tests/build-vm-and-test.sh test
+        name: "Boot the reproducible image and run goss (sshd must come up)"
+        env:
+          RELEASE: trixie
+          TARGET: VM
+
+      - name: Archive VM image + results on failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reproducible-functional-results
+          path: |
+            tests/results/
+            qemu.img
+          if-no-files-found: warn
+          retention-days: 7
