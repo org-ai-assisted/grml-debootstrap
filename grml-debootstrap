@@ -1674,15 +1674,15 @@ make_esp_reproducible() {
 }
 # }}}
 
-# re-image the root filesystem deterministically {{{
-reimage_root_filesystem() {
-  # mkfs() created the root filesystem empty and it was populated through a live
-  # mount, so the kernel's online allocator placed files in debootstrap's
-  # (build-varying) unpack order. Re-create it offline with mke2fs -d, which
-  # allocates in a deterministic alphabetical order, yielding an identical image.
-  local reimage_mnt reimage_tree reimage_parent reimage_uuid
-  einfo "Re-imaging the root filesystem for reproducible block allocation"
-  reimage_mnt="$(mktemp -d)"
+# snapshot the populated root filesystem before it is unmounted {{{
+# reimage_tree is a global: snapshot_root_filesystem fills it (while the root fs is
+# still mounted at MNTPOINT) and reimage_root_filesystem consumes it (once the
+# device is unmounted). Copying from the existing mount rather than a fresh mount of
+# the same device avoids a 'device already mounted' failure.
+reimage_tree=''
+snapshot_root_filesystem() {
+  local reimage_parent
+  einfo "Snapshotting the root filesystem for a reproducible re-image"
   # Stage the copied tree on the disk-backed directory holding the image file; a
   # block-device target has only a small RAM-backed devtmpfs there, so use TMPDIR.
   if [ -f "${ORIG_TARGET}" ]; then
@@ -1691,12 +1691,22 @@ reimage_root_filesystem() {
     reimage_parent="${TMPDIR:-/tmp}"
   fi
   reimage_tree="$(mktemp -d -p "${reimage_parent}")"
-  # A fresh read-only mount exposes the on-disk tree with no pseudo filesystems
-  # mounted over it; cp -a preserves everything mke2fs -d relies on.
-  mount -o ro "${TARGET}" "${reimage_mnt}"
-  cp -a "${reimage_mnt}/." "${reimage_tree}/"
-  umount "${reimage_mnt}"
-  rmdir "${reimage_mnt}"
+  # Copy from the still-mounted MNTPOINT. --one-file-system stays on the root fs, so
+  # any pseudo-filesystems still mounted under it (/proc, /sys, /dev) are not
+  # descended into; cp -a preserves everything mke2fs -d relies on.
+  cp -a --one-file-system "${MNTPOINT}/." "${reimage_tree}/"
+}
+# }}}
+
+# re-image the root filesystem deterministically from the snapshot {{{
+reimage_root_filesystem() {
+  # The tree was populated through a live mount, so the kernel's online allocator
+  # placed files in debootstrap's (build-varying) unpack order. Re-create the
+  # filesystem offline with mke2fs -d, which allocates in a deterministic
+  # alphabetical order, yielding an identical image every build.
+  local reimage_uuid
+  [ -n "${reimage_tree}" ] && [ -d "${reimage_tree}" ] || return 0
+  einfo "Re-imaging the root filesystem for reproducible block allocation"
   # Preserve the existing UUID (fstab and bootloader reference it); the last -U
   # wins, so this is a no-op when MKFS_OPTS already sets the same value.
   reimage_uuid="$(blkid -o value -s UUID "${TARGET}")"
@@ -1704,6 +1714,7 @@ reimage_root_filesystem() {
   SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" "${MKFS}" ${MKFS_OPTS} \
     -U "${reimage_uuid}" -d "${reimage_tree}" -F "${TARGET}"
   rm -rf "${reimage_tree}"
+  reimage_tree=''
   # Re-applying tune2fs restores the periodic-fsck tuning the reimage dropped.
   if [ -n "${TUNE2FS}" ]; then
     # shellcheck disable=SC2086
@@ -1755,10 +1766,16 @@ umount_target() {
     make_esp_reproducible
   fi
 
+  # Snapshot the populated root filesystem while it is still mounted (reproducible
+  # builds only; no-op otherwise), then unmount and re-create it deterministically
+  # from the snapshot below while the partition mapping still exists.
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] \
+     && echo "$MKFS" | grep -q "mkfs.ext"; then
+    snapshot_root_filesystem
+  fi
+
   try_umount 3 "${MNTPOINT}"
 
-  # Re-image and timestamp-normalize the root filesystem while its partition
-  # mapping still exists (reproducible builds only; no-op otherwise).
   if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] \
      && echo "$MKFS" | grep -q "mkfs.ext"; then
     reimage_root_filesystem
