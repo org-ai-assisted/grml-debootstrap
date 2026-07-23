@@ -1307,6 +1307,25 @@ mkfs() {
     esac
   fi
 
+  # Make the ext4 metadata reproducible. mke2fs otherwise stores a random
+  # directory hash seed (which also drives htree ordering, cascading into
+  # different block allocation) and, with metadata_csum_seed, a random checksum
+  # seed. Pin the hash seed to the fixed filesystem UUID and drop
+  # metadata_csum_seed so the checksum seed follows that UUID. The UUID must be
+  # set here at mkfs time, not only via the tune2fs below: without
+  # metadata_csum_seed the seed is the UUID, and changing it afterwards would
+  # leave a filesystem the kernel refuses to mount.
+  if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] && echo "$MKFS" | grep -q "mkfs.ext"; then
+    MKFS_OPTS="$MKFS_OPTS -E hash_seed=$FS_IDENTIFIER -U $FS_IDENTIFIER"
+    # Older mke2fs (< 1.43) rejects the unknown feature; there the checksum seed
+    # already follows the UUID, so nothing needs disabling.
+    local e2fsprogs_version
+    e2fsprogs_version="$(dpkg-query --show --showformat='${Version}' e2fsprogs 2>/dev/null || echo 1.44)"
+    if dpkg --compare-versions "$e2fsprogs_version" ge '1.43'; then
+      MKFS_OPTS="$MKFS_OPTS -O ^metadata_csum_seed"
+    fi
+  fi
+
   if [ -n "$MKFS" ] ; then
     einfo "Running $MKFS $MKFS_OPTS on $TARGET"
     # shellcheck disable=SC2086
@@ -1613,6 +1632,103 @@ prepare_image() {
 }
 # }}}
 
+# rebuild the EFI System Partition FAT deterministically {{{
+make_esp_reproducible() {
+  # grub-install populates the ESP through a live vfat mount, which stamps every
+  # FAT directory entry with the wall-clock time (including a create time that
+  # touch cannot set); SOURCE_DATE_EPOCH only affects mkfs.fat, not a live mount.
+  # Extract the tree, pin its mtimes, zero the partition, re-mkfs and copy back.
+  local esp_tmp_dir esp_top esp_entry
+  einfo "Making the ESP reproducible"
+  esp_tmp_dir="$(mktemp -d)"
+  # -a extracts hidden/system root entries too; IFS= read -r keeps odd names
+  # intact - this rebuild is destructive, so anything not extracted is lost.
+  mdir -i "${EFI_TARGET}" -b -a ::/ 2>/dev/null | sed 's#^::/##; s#/$##' \
+    | while IFS= read -r esp_top; do
+    [ -n "${esp_top}" ] && MTOOLS_SKIP_CHECK=1 \
+      mcopy -s -i "${EFI_TARGET}" "::/${esp_top}" "${esp_tmp_dir}/"
+  done
+  find "${esp_tmp_dir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+  # mkfs.fat and mcopy write only metadata and file contents, so cluster slack
+  # and free clusters keep stale timestamped bytes; zero the partition first.
+  blkdiscard --zeroout "${EFI_TARGET}" 2>/dev/null \
+    || dd if=/dev/zero of="${EFI_TARGET}" bs=1M status=none 2>/dev/null || true
+  mkfs.fat -F32 -n "EFI" "${EFI_TARGET}" >/dev/null
+  ( shopt -s dotglob nullglob
+    for esp_entry in "${esp_tmp_dir}"/*; do
+      MTOOLS_SKIP_CHECK=1 mcopy -s -m -i "${EFI_TARGET}" "${esp_entry}" ::/
+    done )
+  rm -rf "${esp_tmp_dir}"
+}
+# }}}
+
+# re-image the root filesystem deterministically {{{
+reimage_root_filesystem() {
+  # mkfs() created the root filesystem empty and it was populated through a live
+  # mount, so the kernel's online allocator placed files in debootstrap's
+  # (build-varying) unpack order. Re-create it offline with mke2fs -d, which
+  # allocates in a deterministic alphabetical order, yielding an identical image.
+  local reimage_mnt reimage_tree reimage_parent reimage_uuid
+  einfo "Re-imaging the root filesystem for reproducible block allocation"
+  reimage_mnt="$(mktemp -d)"
+  # Stage the copied tree on the disk-backed directory holding the image file; a
+  # block-device target has only a small RAM-backed devtmpfs there, so use TMPDIR.
+  if [ -f "${ORIG_TARGET}" ]; then
+    reimage_parent="$(dirname "${ORIG_TARGET}")"
+  else
+    reimage_parent="${TMPDIR:-/tmp}"
+  fi
+  reimage_tree="$(mktemp -d -p "${reimage_parent}")"
+  # A fresh read-only mount exposes the on-disk tree with no pseudo filesystems
+  # mounted over it; cp -a preserves everything mke2fs -d relies on.
+  mount -o ro "${TARGET}" "${reimage_mnt}"
+  cp -a "${reimage_mnt}/." "${reimage_tree}/"
+  umount "${reimage_mnt}"
+  rmdir "${reimage_mnt}"
+  # Preserve the existing UUID (fstab and bootloader reference it); the last -U
+  # wins, so this is a no-op when MKFS_OPTS already sets the same value.
+  reimage_uuid="$(blkid -o value -s UUID "${TARGET}")"
+  # shellcheck disable=SC2086
+  SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" "${MKFS}" ${MKFS_OPTS} \
+    -U "${reimage_uuid}" -d "${reimage_tree}" -F "${TARGET}"
+  rm -rf "${reimage_tree}"
+  # Re-applying tune2fs restores the periodic-fsck tuning the reimage dropped.
+  if [ -n "${TUNE2FS}" ]; then
+    # shellcheck disable=SC2086
+    ${TUNE2FS} "${TARGET}" </dev/null
+  fi
+}
+# }}}
+
+# pin the root filesystem superblock timestamps {{{
+normalize_root_superblock() {
+  # The kernel stamped the last-mount time and lifetime-writes counter with
+  # wall-clock values while the fs was mounted; mke2fs honours SOURCE_DATE_EPOCH
+  # for the creation time but not these. Pin them with debugfs, which also
+  # re-stamps the write time honouring SOURCE_DATE_EPOCH on close. Times are hex
+  # because debugfs misparses large decimals.
+  local sde_hex sde_cmd debugfs_err
+  einfo "Normalizing the root filesystem superblock timestamps"
+  sde_hex="$(printf '0x%x' "${SOURCE_DATE_EPOCH}")"
+  # Field names carry no 's_' prefix; an 's_'-prefixed name is rejected outright.
+  for sde_cmd in "set_super_value mtime ${sde_hex}" \
+                 "set_super_value wtime ${sde_hex}" \
+                 "set_super_value lastcheck ${sde_hex}" \
+                 "set_super_value kbytes_written 0"; do
+    # debugfs exits 0 even when set_super_value fails internally, so inspect its
+    # stderr and bail out on a real error.
+    debugfs_err="$(SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+      debugfs -w -R "${sde_cmd}" "${TARGET}" 2>&1 1>/dev/null)"
+    case "${debugfs_err}" in
+      *"set_super_value:"*)
+        eerror "debugfs rejected '${sde_cmd}' on ${TARGET}: ${debugfs_err}"
+        bailout 1
+        ;;
+    esac
+  done
+}
+# }}}
+
 # unmount VM image {{{
 umount_target() {
   if [ -z "${VIRTUAL}" ] ; then
@@ -1621,7 +1737,22 @@ umount_target() {
 
   try_umount 3 "${MNTPOINT}"/boot/efi
 
+  # Rebuild the ESP FAT deterministically (reproducible builds only; no-op when
+  # SOURCE_DATE_EPOCH is unset or there is no EFI partition).
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$EFI_TARGET" ] && [ -b "$EFI_TARGET" ]; then
+    make_esp_reproducible
+  fi
+
   try_umount 3 "${MNTPOINT}"
+
+  # Re-image and timestamp-normalize the root filesystem while its partition
+  # mapping still exists (reproducible builds only; no-op otherwise).
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] \
+     && echo "$MKFS" | grep -q "mkfs.ext"; then
+    reimage_root_filesystem
+    normalize_root_superblock
+  fi
+
   kpartx -d "${ORIG_TARGET}" >/dev/null
   # Workaround for a bug in kpartx which doesn't clean up properly,
   # see Debian Bug #891077 and Github-PR grml/grml-debootstrap#112
@@ -1744,6 +1875,8 @@ preparechroot() {
   [ -n "$SCRIPTS" ]                   && echo "SCRIPTS='${SCRIPTS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$SECURE" ]                    && echo "SECURE='${SECURE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$SELECTED_PARTITIONS" ]       && echo "SELECTED_PARTITIONS='${SELECTED_PARTITIONS//\'/\'\\\'\'}'"           >> "$CHROOT_VARIABLES"
+  # so chroot-script honours it (reproducible fstab header date)
+  [ -n "${SOURCE_DATE_EPOCH:-}" ]     && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$TARGET" ]                    && echo "TARGET='${TARGET//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$UPGRADE_SYSTEM" ]            && echo "UPGRADE_SYSTEM='${UPGRADE_SYSTEM//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$TARGET_UUID" ]               && echo "TARGET_UUID='${TARGET_UUID//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
