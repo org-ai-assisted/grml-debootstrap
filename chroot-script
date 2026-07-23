@@ -919,28 +919,13 @@ reproducible_finalize() {
   echo "Applying reproducible-build finalization."
 
   # Per-install secrets are random (SSH host keys) or embed a build timestamp
-  # (aliases.db), so they differ every build. Remove them so they are not baked
-  # into the image, and install a oneshot service that regenerates them on first
-  # boot -- BEFORE the services that need them -- so the image stays functional.
-  # (Debian does not regenerate missing host keys on its own.) The condition makes
-  # it a genuine first-boot-only action.
-  cat > /etc/systemd/system/grml-reproducible-firstboot.service <<'EOF'
-[Unit]
-Description=Regenerate per-install secrets stripped for a reproducible build
-Before=ssh.service sshd.service postfix.service
-ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'ssh-keygen -A; command -v newaliases >/dev/null 2>&1 && newaliases || true'
-[Install]
-WantedBy=multi-user.target
-EOF
-  mkdir -p /etc/systemd/system/multi-user.target.wants
-  ln -sf ../grml-reproducible-firstboot.service \
-    /etc/systemd/system/multi-user.target.wants/grml-reproducible-firstboot.service
-  rm -f /etc/ssh/ssh_host_*      # regenerated on first boot by the service above
-  rm -f /etc/aliases.db          # rebuilt by newaliases on first boot
+  # (aliases.db), so they differ every build; remove them so they are not baked
+  # into the image. Whether the running system regenerates what it needs on first
+  # boot is verified empirically by the functional (goss) boot test in the
+  # reproducible-build workflow, which asserts sshd is running -- no regeneration
+  # machinery is added here unless that test shows it is required.
+  rm -f /etc/ssh/ssh_host_*
+  rm -f /etc/aliases.db
   : > /etc/machine-id            # systemd regenerates it on first boot
   rm -f /var/lib/dbus/machine-id # bind-remounted from /etc/machine-id on boot
 
