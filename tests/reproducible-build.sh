@@ -103,14 +103,17 @@ if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; t
       | while IFS='|' read -r fa fb; do
           echo "--- ${fa#"$mnt_a"} ($(sudo stat -c%s "$fa" 2>/dev/null) bytes) ---"
           sudo cmp -l "$fa" "$fb" 2>&1 | head -20
-          # Readable-string delta. Use temp files, not process substitution: a
-          # sudo'd diff cannot open the caller's /dev/fd/NN. sudo is only needed to
-          # READ the root-owned image files; the redirect target is user-writable.
+          # Readable-string delta. Use mktemp (not predictable /tmp names, which are
+          # symlink/TOCTOU-prone) and temp files rather than process substitution (a
+          # sudo'd diff cannot open the caller's /dev/fd/NN). sudo is only needed to
+          # READ the root-owned image files; the redirect target is user-owned.
+          sa="$(mktemp)" ; sb="$(mktemp)"
           # shellcheck disable=SC2024
-          sudo strings "$fa" > /tmp/repro_sa.txt 2>/dev/null
+          sudo strings "$fa" > "$sa" 2>/dev/null
           # shellcheck disable=SC2024
-          sudo strings "$fb" > /tmp/repro_sb.txt 2>/dev/null
-          diff /tmp/repro_sa.txt /tmp/repro_sb.txt 2>&1 | head -30
+          sudo strings "$fb" > "$sb" 2>/dev/null
+          diff "$sa" "$sb" 2>&1 | head -30
+          rm -f "$sa" "$sb"
         done
   } >> "$report" 2>&1
   sudo umount "$mnt_a" "$mnt_b" || true
