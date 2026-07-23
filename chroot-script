@@ -920,13 +920,15 @@ reproducible_finalize() {
 
   # Per-install secrets are random (SSH host keys) or embed a build timestamp
   # (aliases.db), so they differ every build; remove them so they are not baked
-  # into the image. Whether the running system regenerates what it needs on first
-  # boot is verified empirically by the functional (goss) boot test in the
-  # reproducible-build workflow, which asserts sshd is running -- no regeneration
-  # machinery is added here unless that test shows it is required.
+  # into the image. No custom regeneration machinery is needed: emptying
+  # /etc/machine-id makes systemd treat the next boot as the first boot
+  # (ConditionFirstBoot=yes), which triggers Debian's own, already-enabled
+  # sshd-keygen.service (ExecStart=ssh-keygen -A, ordered Before=ssh.service) to
+  # regenerate the host keys, so sshd still starts. The default /etc/aliases is
+  # bare, so aliases.db needs no rebuild.
   rm -f /etc/ssh/ssh_host_*
   rm -f /etc/aliases.db
-  : > /etc/machine-id            # systemd regenerates it on first boot
+  : > /etc/machine-id            # empty => first-boot => sshd-keygen.service runs
   rm -f /var/lib/dbus/machine-id # bind-remounted from /etc/machine-id on boot
 
   # Build-time logs and regenerable caches carry wall-clock timestamps or
