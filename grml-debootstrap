@@ -1641,6 +1641,13 @@ make_esp_reproducible() {
   local esp_tmp_dir esp_top esp_entry esp_bytes
   local esp_tops=()
   einfo "Making the ESP reproducible"
+  # mdir/mcopy (mtools) rebuild the FAT without a live mount. They are only needed
+  # for a reproducible EFI build, so mtools is a Recommends, not a Depends; fail
+  # with an actionable message instead of a cryptic "exit code 127" if it is absent.
+  if ! command -v mdir >/dev/null || ! command -v mcopy >/dev/null; then
+    eerror "Reproducible ESP rebuild requires mtools (mdir/mcopy); install the 'mtools' package"
+    bailout 1
+  fi
   esp_tmp_dir="$(mktemp -d)"
   # -a lists hidden/system root entries too. Read the listing into an array rather
   # than piping into a while loop, so a failure below can bailout the whole build
