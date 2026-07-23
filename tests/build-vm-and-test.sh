@@ -65,9 +65,14 @@ if [ "$1" == "run" ]; then
   fi
 
   # we need to run in privileged mode to be able to use loop devices
+  # SOURCE_DATE_EPOCH and FIXED_DISK_IDENTIFIERS are passed through so a reproducibility build
+  # (tests/reproducible-build.sh) can request deterministic timestamps and disk/fs identifiers;
+  # both are unset in a normal test-build, leaving behaviour unchanged.
   exec docker run --privileged --rm -i \
     -v "$(pwd)":/code \
     -e TERM="$TERM" \
+    -e SOURCE_DATE_EPOCH \
+    -e FIXED_DISK_IDENTIFIERS \
     -w /code \
     debian:"$HOST_RELEASE" \
     bash -c './tests/docker-install-deb.sh '"$DEB_NAME"' && ./tests/docker-build-vm.sh '"$(id -u)"' '"/code/$QEMU_IMG"' '"$RELEASE"' '"$TARGET"

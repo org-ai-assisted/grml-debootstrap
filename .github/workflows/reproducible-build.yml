@@ -1,0 +1,64 @@
+name: reproducible-build
+
+# Prove grml-debootstrap builds a bit-for-bit reproducible VM image: build the .deb, then build
+# the SAME image twice with deterministic inputs and compare. A green run means the image is
+# reproducible; a red run uploads a diffoscope report showing exactly what still differs.
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    # Weekly, offset from test-build's 03:30 slot to avoid contending for runners.
+    - cron: '30 4 * * 2'
+
+concurrency:
+  group: "reproducible-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: ./tests/gha-build-deb.sh
+        name: "Build .deb for trixie"
+        env:
+          HOST_RELEASE: trixie
+
+      - name: Archive built .deb
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb-trixie
+          if-no-files-found: error
+          path: |
+            *.deb
+
+  reproducible:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download built deb
+        uses: actions/download-artifact@v8
+        with:
+          name: deb-trixie
+
+      - run: ./tests/reproducible-build.sh
+        name: "Build the VM image twice and compare (SOURCE_DATE_EPOCH + FIXED_DISK_IDENTIFIERS)"
+        env:
+          HOST_RELEASE: trixie
+          RELEASE: trixie
+          TARGET: VM
+
+      - name: Archive diffoscope report on failure
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: reproducible-report
+          path: reproducible-report.txt
+          if-no-files-found: warn
+          retention-days: 14
