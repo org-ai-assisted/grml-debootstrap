@@ -48,10 +48,46 @@ if [ "$sha_a" = "$sha_b" ]; then
   exit 0
 fi
 
-echo 'RESULT: images DIFFER -- not reproducible. Localizing the difference with diffoscope.' >&2
-sudo apt-get -qq -y install diffoscope >/dev/null 2>&1 || true
-if command -v diffoscope >/dev/null ; then
-  diffoscope "$img_a" "$img_b" --text reproducible-report.txt || true
-  echo 'diffoscope report written to reproducible-report.txt' >&2
+echo 'RESULT: images DIFFER -- not reproducible. Localizing the difference.' >&2
+
+# The raw images are multi-GB, so diffoscope over them is impractical; instead pinpoint the
+# difference structurally: the raw byte offset, the partition table, then -- most usefully -- the
+# root filesystem's file contents and mtimes (the latter is the usual remaining reproducibility
+# gap: a package maintainer script that stamps a file with the wall-clock build time).
+report='reproducible-report.txt'
+{
+  echo "A sha256: ${sha_a}"
+  echo "B sha256: ${sha_b}"
+  echo
+  echo '=== first differing byte (cmp) ==='
+  cmp "$img_a" "$img_b" || true
+  echo "differing byte count: $(cmp -l "$img_a" "$img_b" 2>/dev/null | wc -l)"
+  echo
+  echo '=== partition table diff (sfdisk -d) ==='
+  diff <(sfdisk -d "$img_a" 2>/dev/null) <(sfdisk -d "$img_b" 2>/dev/null) || true
+} > "$report" 2>&1
+
+loop_a="$(sudo losetup -fP --show "$img_a")"
+loop_b="$(sudo losetup -fP --show "$img_b")"
+mnt_a="$(mktemp -d)"
+mnt_b="$(mktemp -d)"
+# The ext4 root is the last partition (p1 on a plain msdos VM, p2 when an ESP precedes it).
+root_a="${loop_a}p1" ; root_b="${loop_b}p1"
+if [ -e "${loop_a}p2" ]; then root_a="${loop_a}p2" ; root_b="${loop_b}p2" ; fi
+if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; then
+  {
+    echo
+    echo '=== root filesystem: file content differences (diff -qr) ==='
+    sudo diff -qr "$mnt_a" "$mnt_b" 2>&1 | head -200
+    echo
+    echo '=== root filesystem: file mtime differences (epoch path) ==='
+    diff <(cd "$mnt_a" && sudo find . -printf '%T@ %p\n' | sort -k2) \
+         <(cd "$mnt_b" && sudo find . -printf '%T@ %p\n' | sort -k2) | head -200
+  } >> "$report" 2>&1
+  sudo umount "$mnt_a" "$mnt_b" || true
 fi
+sudo losetup -d "$loop_a" "$loop_b" || true
+
+echo "--- ${report} ---" >&2
+cat "$report" >&2
 exit 1
