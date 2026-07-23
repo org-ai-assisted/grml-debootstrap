@@ -42,7 +42,19 @@ if [ "$1" == "setup" ]; then
   fi
   # vncsnapshot might not be available, though we don't want to abort execution then
   sudo apt-get -qq -y install vncsnapshot || true
-  [ -x ./tests/goss ] || curl -fsSL https://goss.rocks/install | GOSS_DST="$(pwd)/tests" sh
+  # Fetch goss directly from its GitHub release. The goss.rocks/install script
+  # builds a non-existent 'goss_<ver>_linux_x86_64.tar.gz' URL (goss ships bare
+  # 'goss-linux-<arch>' binaries), so it 404s and tar aborts. Pin the version,
+  # pick the runner's architecture, and verify the published sha256.
+  if [ ! -x ./tests/goss ]; then
+    goss_ver='v0.4.9'
+    goss_arch="$(dpkg --print-architecture)"
+    goss_url="https://github.com/goss-org/goss/releases/download/${goss_ver}/goss-linux-${goss_arch}"
+    curl -fsSL -o ./tests/goss "${goss_url}"
+    goss_sha="$(curl -fsSL "${goss_url}.sha256" | awk '{print $1}')"
+    echo "${goss_sha}  ./tests/goss" | sha256sum -c -
+    chmod +x ./tests/goss
+  fi
   # TODO: docker.io
   exit 0
 fi
