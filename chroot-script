@@ -744,8 +744,12 @@ is_grub_bios_compatible() {
   # losetup --partscan partitions and depends on /sys being fully visible in the
   # chroot -- when it misses, grub is installed EFI-only (grub-efi-amd64 instead
   # of grub-cloud-amd64) and the resulting disk cannot boot on BIOS firmware.
-  if sfdisk --dump "$GRUB" 2>/dev/null \
-       | grep -qiE 'type=21686148-6449-6e6f-744e-656564454649'; then
+  local sfdisk_dump
+  sfdisk_dump="$(sfdisk --dump "$GRUB" 2>&1)" || true
+  printf '%s\n' "is_grub_bios_compatible: sfdisk --dump ${GRUB}:" >&2
+  printf '%s\n' "$sfdisk_dump" >&2
+  if printf '%s\n' "$sfdisk_dump" \
+       | grep -qiE '21686148-6449-6e6f-744e-656564454649|bios_grub'; then
     return 0
   fi
   # Fallback: scan lsblk for a BIOS boot partition (kpartx /dev/mapper/loopXpY).
