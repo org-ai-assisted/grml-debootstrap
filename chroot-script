@@ -736,22 +736,32 @@ is_grub_bios_compatible() {
   # Check if the disk uses an MSDOS partition table, these are always compatible
   if [[ "$(blkid "$GRUB")" =~ 'PTTYPE="dos"' ]]; then
     return 0
-  # Look for a BIOS boot partition otherwise
-  else
-    SEARCH_STR="$GRUB"
-    if [[ "$SEARCH_STR" =~ ^/dev/loop ]]; then
-      SEARCH_STR="${SEARCH_STR//\/dev\//}" # loopX
-      SEARCH_STR="/dev/mapper/${SEARCH_STR}" # /dev/mapper/loopX
-      # Note that /dev/mapper/loopX won't actually exist, but
-      # /dev/mapper/loopXpY will, so this works for the regex check in the
-      # while loop below.
-    fi
-    while read -r line; do
-      if [[ "$line" =~ ^${SEARCH_STR}.*21686148-6449-6e6f-744e-656564454649$ ]]; then
-        return 0
-      fi
-    done < <(lsblk -pnlo NAME,PARTTYPE)
   fi
+  # A GPT BIOS boot partition (type GUID 21686148-6449-6e6f-744e-656564454649)
+  # makes the disk BIOS-bootable. Read the partition table straight from the
+  # device with sfdisk: this is reliable inside the chroot and for the loop /
+  # kpartx build device, whereas the 'lsblk PARTTYPE' scan below is empty for
+  # losetup --partscan partitions and depends on /sys being fully visible in the
+  # chroot -- when it misses, grub is installed EFI-only (grub-efi-amd64 instead
+  # of grub-cloud-amd64) and the resulting disk cannot boot on BIOS firmware.
+  if sfdisk --dump "$GRUB" 2>/dev/null \
+       | grep -qiE 'type=21686148-6449-6e6f-744e-656564454649'; then
+    return 0
+  fi
+  # Fallback: scan lsblk for a BIOS boot partition (kpartx /dev/mapper/loopXpY).
+  SEARCH_STR="$GRUB"
+  if [[ "$SEARCH_STR" =~ ^/dev/loop ]]; then
+    SEARCH_STR="${SEARCH_STR//\/dev\//}" # loopX
+    SEARCH_STR="/dev/mapper/${SEARCH_STR}" # /dev/mapper/loopX
+    # Note that /dev/mapper/loopX won't actually exist, but
+    # /dev/mapper/loopXpY will, so this works for the regex check in the
+    # while loop below.
+  fi
+  while read -r line; do
+    if [[ "$line" =~ ^${SEARCH_STR}.*21686148-6449-6e6f-744e-656564454649$ ]]; then
+      return 0
+    fi
+  done < <(lsblk -pnlo NAME,PARTTYPE)
   return 1
 }
 
