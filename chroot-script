@@ -738,18 +738,17 @@ is_grub_bios_compatible() {
     return 0
   fi
   # A GPT BIOS boot partition (type GUID 21686148-6449-6e6f-744e-656564454649)
-  # makes the disk BIOS-bootable. Read the partition table straight from the
-  # device with sfdisk: this is reliable inside the chroot and for the loop /
-  # kpartx build device, whereas the 'lsblk PARTTYPE' scan below is empty for
-  # losetup --partscan partitions and depends on /sys being fully visible in the
-  # chroot -- when it misses, grub is installed EFI-only (grub-efi-amd64 instead
-  # of grub-cloud-amd64) and the resulting disk cannot boot on BIOS firmware.
-  local sfdisk_dump
-  sfdisk_dump="$(sfdisk --dump "$GRUB" 2>&1)" || true
-  printf '%s\n' "is_grub_bios_compatible: sfdisk --dump ${GRUB}:" >&2
-  printf '%s\n' "$sfdisk_dump" >&2
-  if printf '%s\n' "$sfdisk_dump" \
-       | grep -qiE '21686148-6449-6e6f-744e-656564454649|bios_grub'; then
+  # makes the disk BIOS-bootable. Detect it with partx, which is in util-linux
+  # (present in the minimal build chroot) and reads the GPT straight from the
+  # whole-disk device, printing each partition's type GUID. This is reliable for
+  # the loop/kpartx build device, whereas the 'lsblk PARTTYPE' scan below is empty
+  # for these and sfdisk is unavailable (it lives in the separate 'fdisk' package,
+  # not in the chroot). When detection misses, grub is installed EFI-only
+  # (grub-efi-amd64 instead of grub-cloud-amd64) and the disk cannot boot on BIOS.
+  local partx_types
+  partx_types="$(partx --show --noheadings --output TYPE "$GRUB" 2>&1)" || true
+  if printf '%s\n' "$partx_types" \
+       | grep -qiE '21686148-6449-6e6f-744e-656564454649'; then
     return 0
   fi
   # Fallback: scan lsblk for a BIOS boot partition (kpartx /dev/mapper/loopXpY).
