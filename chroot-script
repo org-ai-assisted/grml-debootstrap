@@ -33,6 +33,10 @@ bash -n /etc/debootstrap/variables
 # shellcheck source=tests/shellcheck-stub-debootstrap-variables
 . /etc/debootstrap/variables || exit 1
 
+# Export SOURCE_DATE_EPOCH so every child process honours it (mkinitramfs, dpkg,
+# and other SOURCE_DATE_EPOCH-aware tools) -- required for a reproducible image.
+[ -n "${SOURCE_DATE_EPOCH:-}" ] && export SOURCE_DATE_EPOCH
+
 [ -r /proc/1 ] || mount -t proc none /proc
 [ -r /sys/kernel ] || mount -t sysfs none /sys
 
@@ -411,8 +415,35 @@ passwords()
   fi
 
   if [ -n "$ROOTPASSWORD" ] ; then
-     # shellcheck disable=SC2086
-     echo root:"$ROOTPASSWORD" | chpasswd $CHPASSWD_OPTION
+     if [ -n "${SOURCE_DATE_EPOCH:-}" ] ; then
+       # Reproducible builds: chpasswd would pick a random salt, so /etc/shadow would
+       # differ every build. Hash with a fixed salt using the yescrypt algorithm
+       # (prefix $y$); perl's crypt() uses the system crypt() and Debian's libcrypt
+       # (perl-base is Essential) implements yescrypt.
+       #
+       # SECURITY: the salt is derived from ROOTPASSWORD_SEED. When it is unset the
+       # salt falls back to SOURCE_DATE_EPOCH, so everyone building with the same
+       # SOURCE_DATE_EPOCH hashes the root password with the same salt (as do several
+       # images sharing one SOURCE_DATE_EPOCH). Set ROOTPASSWORD_SEED to a fixed,
+       # initially random value if the root password is relied upon for security.
+       if [ -n "${ROOTPASSWORD_SEED:-}" ] ; then
+         password_seed="$ROOTPASSWORD_SEED"
+       else
+         password_seed="$SOURCE_DATE_EPOCH"
+       fi
+       # j9T is libcrypt's default yescrypt cost parameter; the salt characters are
+       # hex, a subset of crypt's base64 alphabet, so the setting string is valid.
+       repro_salt="$(printf '%s' "$password_seed" | sha256sum | cut -c1-16)"
+       repro_hash="$(perl -e 'print crypt($ARGV[0], "\$y\$j9T\$".$ARGV[1]."\$")' "$ROOTPASSWORD" "$repro_salt")"
+       if [ -z "$repro_hash" ] || [ "${repro_hash#\$y\$}" = "$repro_hash" ] ; then
+         echo "Error: failed to compute a reproducible yescrypt hash for the root password." >&2
+         exit 1
+       fi
+       echo "root:$repro_hash" | chpasswd -e
+     else
+       # shellcheck disable=SC2086
+       echo root:"$ROOTPASSWORD" | chpasswd $CHPASSWD_OPTION
+     fi
      export ROOTPASSWORD=''
   else
     a='1'
@@ -494,8 +525,16 @@ timezone() {
 # shellcheck disable=SC2329
 createfstab(){
   echo "Setting up /etc/fstab"
+  # Honour SOURCE_DATE_EPOCH (reproducible builds) instead of the wall-clock
+  # date, so the fstab header is identical across builds; falls back to date.
+  local fstab_created_on
+  if [ -n "${SOURCE_DATE_EPOCH:-}" ] ; then
+    fstab_created_on="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}")"
+  else
+    fstab_created_on="$(date)"
+  fi
   cat > /etc/fstab <<EOF
-# /etc/fstab - created by grml-debootstrap on $(date)
+# /etc/fstab - created by grml-debootstrap on ${fstab_created_on}
 # Accessible filesystems, by reference, are maintained under '/dev/disk/'.
 # See man pages fstab(5), findfs(8), mount(8) and/or blkid(8) for more info.
 #
@@ -714,22 +753,52 @@ is_grub_bios_compatible() {
   # Check if the disk uses an MSDOS partition table, these are always compatible
   if [[ "$(blkid "$GRUB")" =~ 'PTTYPE="dos"' ]]; then
     return 0
-  # Look for a BIOS boot partition otherwise
-  else
-    SEARCH_STR="$GRUB"
-    if [[ "$SEARCH_STR" =~ ^/dev/loop ]]; then
-      SEARCH_STR="${SEARCH_STR//\/dev\//}" # loopX
-      SEARCH_STR="/dev/mapper/${SEARCH_STR}" # /dev/mapper/loopX
-      # Note that /dev/mapper/loopX won't actually exist, but
-      # /dev/mapper/loopXpY will, so this works for the regex check in the
-      # while loop below.
-    fi
-    while read -r line; do
-      if [[ "$line" =~ ^${SEARCH_STR}.*21686148-6449-6e6f-744e-656564454649$ ]]; then
-        return 0
-      fi
-    done < <(lsblk -pnlo NAME,PARTTYPE)
   fi
+  # A GPT BIOS boot partition (type GUID 21686148-6449-6e6f-744e-656564454649)
+  # makes the disk BIOS-bootable. Detect it with partx, which is in util-linux
+  # (present in the minimal build chroot) and reads the GPT straight from the
+  # whole-disk device, printing each partition's type GUID. This is reliable for
+  # the loop/kpartx build device, whereas the 'lsblk PARTTYPE' scan below is empty
+  # for these and sfdisk is unavailable (it lives in the separate 'fdisk' package,
+  # not in the chroot). When detection misses, grub is installed EFI-only
+  # (grub-efi-amd64 instead of grub-cloud-amd64) and the disk cannot boot on BIOS.
+  #
+  # Concrete reproduction of the pre-partx failure (a disk that should be BIOS+UEFI
+  # bootable but comes out UEFI-only):
+  #   grml-debootstrap --vm --vmefi --vmfile --vmsize 4G --target /tmp/gd.img \
+  #     --release trixie --password foo
+  # This lays out a GPT with an ESP (part 1), a bios_grub partition (part 2, type
+  # GUID above) and root (part 3), so the image is meant to boot on both BIOS and
+  # UEFI. GRUB is the whole-disk loop device (/dev/loopN). Inside the chroot the old
+  # scan ran `lsblk -pnlo NAME,PARTTYPE` against /dev/mapper/loopNpM: on the build
+  # runner that column comes back empty (udev has not populated PARTTYPE for the
+  # kpartx mapper nodes) and `sfdisk` is not installed, so is_grub_bios_compatible
+  # returned 1 -> MAIN_GRUB_PACKAGE=grub-efi-amd64 (EFI-only). Booting the result
+  # under SeaBIOS (qemu-system-x86_64 -drive file=/tmp/gd.img,format=raw) fails,
+  # while UEFI (adding -bios OVMF) boots -- proving the regression. The partx read
+  # of the whole-disk device detects the bios_grub partition regardless, restoring
+  # grub-cloud-amd64 and BIOS bootability. CI's reproducible VM leg boot-tests the
+  # amd64 image under SeaBIOS, so this path is exercised end to end.
+  local partx_types
+  partx_types="$(partx --show --noheadings --output TYPE "$GRUB" 2>&1)" || true
+  if printf '%s\n' "$partx_types" \
+       | grep -qiE '21686148-6449-6e6f-744e-656564454649'; then
+    return 0
+  fi
+  # Fallback: scan lsblk for a BIOS boot partition (kpartx /dev/mapper/loopXpY).
+  SEARCH_STR="$GRUB"
+  if [[ "$SEARCH_STR" =~ ^/dev/loop ]]; then
+    SEARCH_STR="${SEARCH_STR//\/dev\//}" # loopX
+    SEARCH_STR="/dev/mapper/${SEARCH_STR}" # /dev/mapper/loopX
+    # Note that /dev/mapper/loopX won't actually exist, but
+    # /dev/mapper/loopXpY will, so this works for the regex check in the
+    # while loop below.
+  fi
+  while read -r line; do
+    if [[ "$line" =~ ^${SEARCH_STR}.*21686148-6449-6e6f-744e-656564454649$ ]]; then
+      return 0
+    fi
+  done < <(lsblk -pnlo NAME,PARTTYPE)
   return 1
 }
 
@@ -890,6 +959,63 @@ finalize() {
 }
 # }}}
 
+# reproducible-build finalization {{{
+# shellcheck disable=SC2329
+reproducible_finalize() {
+  [ -n "${SOURCE_DATE_EPOCH:-}" ] || return 0
+  echo "Applying reproducible-build finalization."
+
+  # Per-install secrets are random (SSH host keys) or embed a build timestamp
+  # (aliases.db), so they differ every build; remove them so they are not baked
+  # into the image. No custom regeneration machinery is needed: making the next
+  # boot systemd's "first boot" (ConditionFirstBoot=yes) triggers Debian's own,
+  # already-enabled sshd-keygen.service (ExecStart=ssh-keygen -A, ordered
+  # Before=ssh.service) to regenerate the host keys, so sshd still starts. The
+  # default /etc/aliases is bare, so aliases.db needs no rebuild.
+  rm -f /etc/ssh/ssh_host_*
+  rm -f /etc/aliases.db
+  # ConditionFirstBoot needs /etc/machine-id to be absent or the literal
+  # "uninitialized"; an EMPTY file does NOT trigger it (systemd just commits a
+  # transient id and firstboot stays false, so sshd-keygen is skipped and sshd
+  # fails with no host keys). "uninitialized" is deterministic, so reproducible.
+  printf 'uninitialized\n' > /etc/machine-id
+  rm -f /var/lib/dbus/machine-id # bind-remounted from /etc/machine-id on boot
+
+  # The debconf database (/var/cache/debconf/config.dat) is deliberately NOT removed
+  # -- it holds real configured answers and 'seen' flags, not a regenerable cache. It
+  # carries one build-varying value: grub records its install device as the ephemeral
+  # build loop device (/dev/loopN), whose number depends on host loop allocation.
+  # Canonicalize just that answer to a stable placeholder using debconf's own tooling
+  # rather than editing config.dat by hand (a hand-edit can corrupt the database and
+  # misses debconf's on-disk encoding). The value is meaningless on the deployed
+  # system (a different disk, reset on first configure), so only its determinism
+  # matters. Re-set every grub *_install_devices answer debconf currently holds; the
+  # owning package is the part of the key before the '/'.
+  while read -r install_devices_key; do
+    [ -n "$install_devices_key" ] || continue
+    printf '%s %s multiselect /dev/loop0\n' \
+      "${install_devices_key%%/*}" "$install_devices_key" | debconf-set-selections
+  done < <(sed -n 's/^Name: \(grub[^ ]*\/install_devices\)$/\1/p' \
+    /var/cache/debconf/config.dat 2>/dev/null | sort -u)
+  # config.dat-old is debconf's backup of the pre-write database and still holds the
+  # build-varying loop device. debconf recreates it on the deployed system's next
+  # database write, so deleting it here is safe and removes the build-varying bytes.
+  # Delete it AFTER the debconf-set-selections writes above, which would otherwise
+  # recreate it from the not-yet-canonicalized database.
+  rm -f /var/cache/debconf/config.dat-old
+  rm -f /var/log/alternatives.log /var/log/dpkg.log \
+        /var/log/apt/history.log /var/log/apt/term.log
+  rm -f /var/cache/ldconfig/aux-cache        # regenerated by ldconfig
+  rm -rf /run/blkid                          # runtime device cache (/run is tmpfs on boot)
+  # update-locale / systemd may order /etc/locale.conf's variables differently
+  # between builds; sort it so it is stable (systemd reads it order-independently).
+  [ -f /etc/locale.conf ] && LC_ALL=C sort -o /etc/locale.conf /etc/locale.conf
+  # grml-debootstrap's own config copy records the build parameters; drop it (it
+  # also avoids leaking them into the image).
+  rm -f /etc/debootstrap/config /etc/debootstrap/variables
+}
+# }}}
+
 # signal handler {{{
 # shellcheck disable=SC2329
 signal_handler() {
@@ -913,7 +1039,7 @@ trap signal_handler HUP INT QUIT TERM
      default_locales timezone fstab install_fs_tools hostname \
      initrd grub_install passwords \
      custom_scripts upgrade_system rpi_cmdline remove_apt_cache services \
-     remove_chrootmirror; do
+     remove_chrootmirror reproducible_finalize; do
      if stage "$i" ; then
        "$i"
        stage "$i" 'done'

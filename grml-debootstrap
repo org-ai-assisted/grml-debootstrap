@@ -55,7 +55,6 @@ MNTPOINT="/mnt/debootstrap.$$"
 [ -n "$MBR_IDENTIFIER" ] || MBR_IDENTIFIER='0x00000000'
 [ -n "$EXTRAPACKAGES" ] || EXTRAPACKAGES='yes'
 [ -n "$FALLBACK_MIRROR" ] || FALLBACK_MIRROR='http://deb.debian.org/debian'
-[ -n "$FIXED_DISK_IDENTIFIERS" ] || FIXED_DISK_IDENTIFIERS="no"
 [ -n "$FORCE" ] || FORCE=''
 [ -n "$HOSTNAME" ] || HOSTNAME='grml'
 [ -n "$INITRD" ] || INITRD='yes'
@@ -828,20 +827,42 @@ fi
   exit 0
 }
 
-if [ "${FIXED_DISK_IDENTIFIERS}" = 'yes' ]; then
-  if [ -z "${SOURCE_DATE_EPOCH}" ] \
-    || ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[0-9]+$ ]]; then
-    SOURCE_DATE_EPOCH="$(date +%s)"
-    ewarn "FIXED_DISK_IDENTIFIERS is set to 'yes', but the SOURCE_DATE_EPOCH setting is not set. Defaulting to the current time (${SOURCE_DATE_EPOCH})."
+# Reproducible builds are enabled solely by SOURCE_DATE_EPOCH, the tool-agnostic
+# switch used across the reproducible-builds ecosystem; there is no separate on/off
+# flag. When it is set to a decimal integer in the range (0, INT64_MAX) the build is
+# reproducible: disk/filesystem identifiers are derived deterministically from it and
+# the rest of the reproducibility machinery keys off REPRODUCIBLE_BUILD. A set but
+# malformed value is a hard error rather than a silent non-reproducible build.
+REPRODUCIBLE_BUILD='no'
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+  if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[0-9]+$ ]] \
+    || [ "${SOURCE_DATE_EPOCH}" -le 0 ] \
+    || [ "${SOURCE_DATE_EPOCH}" -ge 9223372036854775807 ]; then
+    eerror "SOURCE_DATE_EPOCH is set to '${SOURCE_DATE_EPOCH}' but is not a decimal integer in the range (0, INT64_MAX)."
+    eerror "Unset it for a non-reproducible build, or set it to a valid value."
+    bailout 1
   fi
+  REPRODUCIBLE_BUILD='yes'
+  # Export once, here, before the build begins, so child programs (mke2fs, debugfs,
+  # the chroot-script, ...) inherit it instead of it being passed explicitly.
+  export SOURCE_DATE_EPOCH
 
   mbr_id_from_seed "${SOURCE_DATE_EPOCH}" MBR_IDENTIFIER
   uuid_from_seed "${SOURCE_DATE_EPOCH}" 5 FS_IDENTIFIER
-  # The GPT partition identifer shouldn't be the similar to the FS identifier.
-  # To avoid confusion if multiple builds are kicked off in quick succession,
-  # it shouldn't be based on SOURCE_DATE_EPOCH + 1 either.
+  # The GPT partition identifier should not resemble the FS identifier. To avoid
+  # confusion if multiple builds are kicked off in quick succession, it also should
+  # not simply be SOURCE_DATE_EPOCH + 1; XOR with a fixed value for a distinct seed.
   uuid_from_seed "$(( SOURCE_DATE_EPOCH ^ 0x0fffffffffffffff ))" 4 \
     GPT_IDENTIFIER_PREFIX
+
+  # SECURITY: with a root password set, the crypt() salt is derived from
+  # ROOTPASSWORD_SEED (see chroot-script). If it is unset the salt falls back to
+  # SOURCE_DATE_EPOCH, so anyone building with the same SOURCE_DATE_EPOCH hashes the
+  # root password with the same salt. Set ROOTPASSWORD_SEED to a fixed, initially
+  # random value if that matters. See the reproducible builds documentation.
+  if [ -z "${ROOTPASSWORD_SEED:-}" ]; then
+    ewarn "Reproducible build: ROOTPASSWORD_SEED is not set; the root password (if any) is hashed with a salt derived only from SOURCE_DATE_EPOCH, shared by everyone using the same SOURCE_DATE_EPOCH. Set ROOTPASSWORD_SEED to a fixed, initially random value if this is a concern."
+  fi
 fi
 # }}}
 
@@ -857,6 +878,19 @@ check4progs mmdebstrap || bailout 1
 
 if [ -n "$VIRTUAL" ] ; then
   check4progs kpartx parted qemu-img || bailout 1
+fi
+
+# A reproducible EFI image rebuilds its FAT ESP with mtools (mdir/mcopy) in
+# make_esp_reproducible. mtools is only a Recommends, so require it here -- only when
+# it will actually be used, i.e. a reproducible build that produces an ESP (VMEFI, or
+# arm64 which is always EFI unless it is a Raspberry Pi image).
+efi_image='no'
+[ -n "$VMEFI" ] && efi_image='yes'
+if [ "$ARCH" = 'arm64' ] && [ -z "$RPI" ] ; then
+  efi_image='yes'
+fi
+if [ "${REPRODUCIBLE_BUILD}" = 'yes' ] && [ -n "$VIRTUAL" ] && [ "$efi_image" = 'yes' ] ; then
+  check4progs mcopy mdir || bailout 1
 fi
 # }}}
 
@@ -883,6 +917,25 @@ if echo "$GRUB" | grep -q '^hd' ; then
    eerror "Error: this syntax for the grub configuration variable is no longer supported."
    eerror "Please do not use hd... any longer but /dev/sdX instead."
    bailout 1
+fi
+# }}}
+
+# reproducible builds need an mke2fs that honours SOURCE_DATE_EPOCH {{{
+# The reproducible re-image (reimage_root_filesystem) relies on mke2fs deriving the
+# superblock timestamps and metadata_csum_seed from SOURCE_DATE_EPOCH; support for
+# that landed in e2fsprogs 1.44.0. On older systems mke2fs would stamp wall-clock
+# times, so a reproducible build is impossible -- refuse rather than emit a
+# silently non-reproducible image.
+if [ "${REPRODUCIBLE_BUILD}" = 'yes' ]; then
+  e2fsprogs_version="$(dpkg-query --show --showformat='${Version}' e2fsprogs 2>/dev/null || true)"
+  if [ -z "${e2fsprogs_version}" ]; then
+    eerror "Cannot determine the e2fsprogs version; reproducible builds require e2fsprogs >= 1.44.0."
+    bailout 1
+  fi
+  if ! dpkg --compare-versions "${e2fsprogs_version}" ge '1.44.0'; then
+    eerror "Reproducible builds require e2fsprogs >= 1.44.0 (mke2fs SOURCE_DATE_EPOCH support), but ${e2fsprogs_version} is installed."
+    bailout 1
+  fi
 fi
 # }}}
 
@@ -1407,20 +1460,21 @@ mkfs() {
     esac
   fi
 
+  # Pin the ext4 directory hash seed and filesystem UUID so mke2fs lays out metadata
+  # deterministically (a random hash seed also drives htree ordering, cascading into
+  # different block allocation). MKFS_OPTS is reused by the offline re-image
+  # (reimage_root_filesystem), where these actually deliver reproducibility; setting
+  # them here too makes the initial filesystem's UUID equal FS_IDENTIFIER, which
+  # reimage_root_filesystem then asserts. mke2fs derives metadata_csum_seed
+  # deterministically from SOURCE_DATE_EPOCH, so it needs no special handling.
+  if [ "$REPRODUCIBLE_BUILD" = 'yes' ] && echo "$MKFS" | grep -q "mkfs.ext"; then
+    MKFS_OPTS="$MKFS_OPTS -E hash_seed=$FS_IDENTIFIER -U $FS_IDENTIFIER"
+  fi
+
   if [ -n "$MKFS" ] ; then
     einfo "Running $MKFS $MKFS_OPTS on $TARGET"
     # shellcheck disable=SC2086
     "$MKFS" $MKFS_OPTS "$TARGET"
-
-    if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
-      if ! echo "$MKFS" | grep -q "mkfs.ext" ; then
-        eerror "Not changing disk uuid for $TARGET because $MKFS doesn't seem to match for ext{2,3,4} file system"
-        bailout 1
-      else
-        einfo "Changing disk uuid for $TARGET to fixed (non-random) value $FS_IDENTIFIER using tune2fs"
-        tune2fs "$TARGET" -U "$FS_IDENTIFIER" </dev/null
-      fi
-    fi
 
     if [ -n "$VIRTUAL" ] && [ -n "$EFI_TARGET" ]; then
       einfo "Creating FAT filesystem on $EFI_TARGET"
@@ -1660,7 +1714,7 @@ prepare_image() {
     parted -s "${TARGET}" 'set 1 boot on'
   fi
 
-  if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
+  if [ "$REPRODUCIBLE_BUILD" = 'yes' ] ; then
     make_disk_ids_deterministic
   fi
 
@@ -1713,6 +1767,145 @@ prepare_image() {
 }
 # }}}
 
+# rebuild the EFI System Partition FAT deterministically {{{
+make_esp_reproducible() {
+  # grub-install populates the ESP through a live vfat mount, which stamps every
+  # FAT directory entry with the wall-clock time (including a create time that
+  # touch cannot set); SOURCE_DATE_EPOCH only affects mkfs.fat, not a live mount.
+  # Extract the tree, pin its mtimes, zero the partition, re-mkfs and copy back.
+  # mdir/mcopy (mtools) rebuild the FAT without a live mount; their presence is
+  # ensured by the check4progs guard for reproducible EFI builds.
+  local esp_tmp_dir esp_top esp_entry
+  local esp_tops=()
+  einfo "Making the ESP reproducible"
+  esp_tmp_dir="$(mktemp -d)"
+  # -a lists hidden/system root entries too. Read the listing into an array rather
+  # than piping into a while loop, so a failure below can bailout the whole build
+  # (a pipe-to-while runs in a subshell where bailout could not); this rebuild is
+  # destructive, so a silently dropped file would be lost from the ESP for good.
+  readarray -t esp_tops < <(mdir -i "${EFI_TARGET}" -b -a ::/ 2>/dev/null | sed 's#^::/##; s#/$##')
+  for esp_top in "${esp_tops[@]}"; do
+    [ -n "${esp_top}" ] || continue
+    if ! MTOOLS_SKIP_CHECK=1 mcopy -s -i "${EFI_TARGET}" "::/${esp_top}" "${esp_tmp_dir}/" ; then
+      eerror "Failed to extract ESP entry '${esp_top}'"
+      bailout 1
+    fi
+  done
+  find "${esp_tmp_dir}" -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
+  # A grub-install-populated ESP is never empty; if the extraction captured nothing
+  # (mdir failed or listed nothing), refuse to wipe it -- otherwise the rebuild
+  # would ship an empty, unbootable ESP with no error.
+  if [ -z "$(ls -A "${esp_tmp_dir}")" ]; then
+    eerror "ESP extraction from ${EFI_TARGET} produced no files; refusing to wipe it"
+    bailout 1
+  fi
+  # mkfs.fat and mcopy write only metadata and file contents, so cluster slack and
+  # free clusters keep stale timestamped bytes; zero the partition first. Failing to
+  # zero reintroduces the non-determinism this step exists to remove, so bail out.
+  # blkdiscard --zeroout has been in util-linux since 2014 (every supported Debian),
+  # so it is always available -- no dd fallback needed.
+  if ! blkdiscard --zeroout "${EFI_TARGET}" ; then
+    eerror "Failed to zero ${EFI_TARGET} before rebuilding the ESP"
+    bailout 1
+  fi
+  mkfs.fat -F32 -n "EFI" "${EFI_TARGET}" >/dev/null
+  # Restore every extracted entry, including hidden/dotfile top-level entries, by
+  # globbing both '<dir>/*' and '<dir>/.*' directly (no dotglob/nullglob, no
+  # subshell). mcopy -m preserves the pinned modification time; when mcopy -m copies
+  # a file to a FAT filesystem it also sets that file's birth and access times to the
+  # same value, so no separate timestamp fix-up is needed. Without nullglob an empty
+  # glob stays literal and the '.'/'..'/literal-pattern entries are skipped below.
+  for esp_entry in "${esp_tmp_dir}"/* "${esp_tmp_dir}"/.*; do
+    case "${esp_entry##*/}" in
+      '.'|'..'|'*'|'.*') continue ;;
+    esac
+    [ -e "${esp_entry}" ] || continue
+    if ! MTOOLS_SKIP_CHECK=1 mcopy -s -m -i "${EFI_TARGET}" "${esp_entry}" ::/ ; then
+      eerror "Failed to restore '${esp_entry}' into the rebuilt ESP"
+      bailout 1
+    fi
+  done
+  rm -rf "${esp_tmp_dir}"
+}
+# }}}
+
+# snapshot the populated root filesystem before it is unmounted {{{
+# reimage_tree is a global: snapshot_root_filesystem fills it (while the root fs is
+# still mounted at MNTPOINT) and reimage_root_filesystem consumes it (once the
+# device is unmounted). Copying from the existing mount rather than a fresh mount of
+# the same device avoids a 'device already mounted' failure.
+reimage_tree=''
+snapshot_root_filesystem() {
+  local reimage_parent
+  einfo "Snapshotting the root filesystem for a reproducible re-image"
+  # Stage the copied tree on the disk-backed directory holding the image file; a
+  # block-device target has only a small RAM-backed devtmpfs there, so use TMPDIR.
+  if [ -f "${ORIG_TARGET}" ]; then
+    reimage_parent="$(dirname "${ORIG_TARGET}")"
+  else
+    reimage_parent="${TMPDIR:-/tmp}"
+  fi
+  reimage_tree="$(mktemp -d -p "${reimage_parent}")"
+  # The root filesystem is mounted at MNTPOINT here: umount_target snapshots before
+  # it unmounts MNTPOINT, and the rest of grml-debootstrap already relies on the root
+  # being at MNTPOINT. Copy from that live mount with --one-file-system so the
+  # pseudo-filesystems still mounted under it (/proc, /sys, /dev) are not descended
+  # into. cp -a preserves everything mke2fs -d relies on.
+  cp -a --one-file-system "${MNTPOINT}/." "${reimage_tree}/"
+}
+# }}}
+
+# re-image the root filesystem deterministically from the snapshot {{{
+reimage_root_filesystem() {
+  # The tree was populated through a live mount, so the kernel's online allocator
+  # placed files in debootstrap's (build-varying) unpack order. Re-create the
+  # filesystem offline with mke2fs -d, which allocates in a deterministic
+  # alphabetical order, yielding an identical image every build.
+  local current_uuid mountpoint_list mp tries
+  [ -n "${reimage_tree}" ] && [ -d "${reimage_tree}" ] || return 0
+  einfo "Re-imaging the root filesystem for reproducible block allocation"
+  # The initial mkfs set the UUID to FS_IDENTIFIER via MKFS_OPTS, and the reimage
+  # below reuses MKFS_OPTS (same -U), so fstab/bootloader references stay valid.
+  # Reproducibility depends on that UUID being FS_IDENTIFIER; if it is not, the image
+  # would build but not reproduce, so bail rather than ship a non-reproducible image.
+  current_uuid="$(blkid -o value -s UUID "${TARGET}")"
+  if [ "${current_uuid}" != "${FS_IDENTIFIER}" ]; then
+    eerror "Root filesystem UUID '${current_uuid}' does not match FS_IDENTIFIER '${FS_IDENTIFIER}'; refusing to re-image ${TARGET} non-reproducibly."
+    bailout 1
+  fi
+  # mke2fs -F overwrites the device, so ensure nothing still has it mounted; it may be
+  # mounted at more than one path. Unmount all of them, retrying up to ten times a
+  # second apart. umount -l is deliberately not used (it defers the real unmount and
+  # is only safe before an imminent reboot).
+  tries=0
+  while true; do
+    readarray -t mountpoint_list \
+      < <(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null)
+    if [ "${#mountpoint_list[@]}" -eq 0 ]; then
+      break
+    fi
+    if [ "${tries}" -ge 10 ]; then
+      eerror "Failed to unmount ${TARGET} after 10 attempts; cannot re-image it."
+      bailout 1
+    fi
+    for mp in "${mountpoint_list[@]}"; do
+      umount "${mp}" 2>/dev/null || true
+    done
+    tries=$((tries + 1))
+    sleep 1
+  done
+  # SOURCE_DATE_EPOCH is already exported; mke2fs inherits it. No -U here: MKFS_OPTS
+  # already pins it to FS_IDENTIFIER (asserted above).
+  # shellcheck disable=SC2086
+  "${MKFS}" ${MKFS_OPTS} -d "${reimage_tree}" -F "${TARGET}"
+  rm -rf "${reimage_tree}"
+  reimage_tree=''
+  # Restore the periodic-fsck tuning the reimage dropped, via the shared helper so a
+  # future change to it does not have to be duplicated here.
+  tunefs
+}
+# }}}
+
 # unmount VM image {{{
 umount_target() {
   if [ -z "${VIRTUAL}" ] ; then
@@ -1721,7 +1914,31 @@ umount_target() {
 
   try_umount 3 "${MNTPOINT}"/boot/efi
 
+  # Rebuild the ESP FAT deterministically (reproducible builds only; no-op when there
+  # is no EFI partition).
+  if [ "${REPRODUCIBLE_BUILD}" = 'yes' ] && [ -n "$EFI_TARGET" ] && [ -b "$EFI_TARGET" ]; then
+    make_esp_reproducible
+  fi
+
+  # Snapshot the populated root filesystem while it is still mounted (reproducible
+  # builds only; no-op otherwise), then unmount and re-create it deterministically
+  # from the snapshot below while the partition mapping still exists.
+  if [ "${REPRODUCIBLE_BUILD}" = 'yes' ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] \
+     && echo "$MKFS" | grep -q "mkfs.ext"; then
+    snapshot_root_filesystem
+  fi
+
   try_umount 3 "${MNTPOINT}"
+
+  # Re-image offline with mke2fs -d; the freshly created filesystem is never remounted
+  # afterwards, so its superblock timestamps stay SOURCE_DATE_EPOCH-derived and no
+  # debugfs post-processing is needed (the too-old-e2fsprogs guard above ensures
+  # mke2fs honours SOURCE_DATE_EPOCH).
+  if [ "${REPRODUCIBLE_BUILD}" = 'yes' ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] \
+     && echo "$MKFS" | grep -q "mkfs.ext"; then
+    reimage_root_filesystem
+  fi
+
   kpartx -d "${ORIG_TARGET}" >/dev/null
   # Workaround for a bug in kpartx which doesn't clean up properly,
   # see Debian Bug #891077 and Github-PR grml/grml-debootstrap#112
@@ -1841,9 +2058,12 @@ preparechroot() {
   [ -n "$RPIFIRM" ]                   && echo "RPIFIRM='${RPIFIRM//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$RM_APTCACHE" ]               && echo "RM_APTCACHE='${RM_APTCACHE//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
   [ -n "$ROOTPASSWORD" ]              && echo "ROOTPASSWORD='${ROOTPASSWORD//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
+  [ -n "${ROOTPASSWORD_SEED:-}" ]     && echo "ROOTPASSWORD_SEED='${ROOTPASSWORD_SEED//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$SCRIPTS" ]                   && echo "SCRIPTS='${SCRIPTS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$SECURE" ]                    && echo "SECURE='${SECURE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$SELECTED_PARTITIONS" ]       && echo "SELECTED_PARTITIONS='${SELECTED_PARTITIONS//\'/\'\\\'\'}'"           >> "$CHROOT_VARIABLES"
+  # so chroot-script honours it (reproducible fstab header date)
+  [ -n "${SOURCE_DATE_EPOCH:-}" ]     && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$TARGET" ]                    && echo "TARGET='${TARGET//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$UPGRADE_SYSTEM" ]            && echo "UPGRADE_SYSTEM='${UPGRADE_SYSTEM//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$TARGET_UUID" ]               && echo "TARGET_UUID='${TARGET_UUID//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"

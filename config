@@ -213,27 +213,27 @@
 # Default: '/etc/debootstrap/install_notes' (empty file).
 # INSTALL_NOTES='/etc/debootstrap/install_notes'
 
-# Use fixed disk identifiers for Virtual Machine builds.
-# Useful for reproducible builds.
-# Default: 'no'
-# FIXED_DISK_IDENTIFIERS='yes'
+# Reproducible builds.
+# Set SOURCE_DATE_EPOCH to a decimal integer in the range (0, INT64_MAX) to build a
+# reproducible Virtual Machine image: disk and filesystem identifiers, the filesystem
+# block layout and all embedded timestamps are then derived deterministically from it,
+# so two builds with the same SOURCE_DATE_EPOCH (and inputs) produce byte-identical
+# images. Leave it unset for a normal, non-reproducible build. There is no separate
+# on/off switch; SOURCE_DATE_EPOCH is the only knob. A reproducible EFI build also
+# needs the 'mtools' package installed.
+# Default: unset
+# SOURCE_DATE_EPOCH='1234567890'
 
-# Filesystem identifier when using FIXED_DISK_IDENTIFIERS='yes'.
-# Use uuid-runtime's uuidgen tool to generate random UUIDs on demand.
-# Default: '26ada0c0-1165-4098-884d-aafd2220c2c6'
-# FS_IDENTIFIER="$(uuidgen)"
-
-# Disk identifier for MBR partition tables when using
-# FIXED_DISK_IDENTIFIERS='yes'. Note that this is used even if a GPT partition
-# table is in use, as it is used as the ID for the GPT's protective MBR.
-# Default: '0x41414141'
-# MBR_IDENTIFIER="0x12345678"
-
-# The first three portions of the GUID identifier for individual partitions
-# when using FIXED_DISK_IDENTIFIERS='yes'. The final portion of the identifier
-# is derived from the partition number for each partition.
-# Default: 'b3170792-c1b6-4b84-b6ac'
-# GPT_IDENTIFIER_PREFIX="12345678-9012-3456-7890"
+# Seed for the root password salt in reproducible builds.
+# SECURITY: with a root password set, the crypt() salt is derived from
+# ROOTPASSWORD_SEED. If it is left unset the salt is derived from SOURCE_DATE_EPOCH
+# instead, which means everyone building with the same SOURCE_DATE_EPOCH hashes the
+# root password with the same salt (and building several images that share a
+# SOURCE_DATE_EPOCH reuses the salt across them). If the root password is relied upon
+# for security, set ROOTPASSWORD_SEED to a fixed but initially randomly generated
+# value, or do not use reproducible builds.
+# Default: unset (falls back to SOURCE_DATE_EPOCH)
+# ROOTPASSWORD_SEED='<a randomly generated fixed value>'
 
 # Delete grml-debootstrap configuration files from installed system.
 # Useful for reproducible builds or if you don't want to leak information.
