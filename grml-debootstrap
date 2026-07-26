@@ -1803,8 +1803,10 @@ make_esp_reproducible() {
   # free clusters keep stale timestamped bytes; zero the partition first. Failing to
   # zero reintroduces the non-determinism this step exists to remove, so bail out.
   # blkdiscard --zeroout has been in util-linux since 2014 (every supported Debian),
-  # so it is always available -- no dd fallback needed.
-  if ! blkdiscard --zeroout "${EFI_TARGET}" ; then
+  # so it is always available -- no dd fallback needed. --force is required because
+  # util-linux >= 2.40 refuses to discard a device with a detected filesystem (the
+  # grub-populated vfat ESP here) unless forced; wiping it is exactly the intent.
+  if ! blkdiscard --zeroout --force "${EFI_TARGET}" ; then
     eerror "Failed to zero ${EFI_TARGET} before rebuilding the ESP"
     bailout 1
   fi
