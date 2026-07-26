@@ -55,95 +55,54 @@ if [ "$sha_a" = "$sha_b" ]; then
   exit 0
 fi
 
-echo 'RESULT: images DIFFER -- not reproducible. Localizing the difference.' >&2
+echo 'RESULT: images DIFFER -- not reproducible. Localizing with diffoscope.' >&2
 
-# Diagnostics only from here: diff/cmp exit non-zero on an expected difference, so do not let
-# errexit abort before the report is written.
-set +e
-
-# The raw images are multi-GB, so diffoscope over them is impractical; instead pinpoint the
-# difference structurally: the raw byte offset, the partition table, then -- most usefully -- the
-# root filesystem's file contents and mtimes (the latter is the usual remaining reproducibility
-# gap: a package maintainer script that stamps a file with the wall-clock build time).
 report='reproducible-report.txt'
-{
-  echo "A sha256: ${sha_a}"
-  echo "B sha256: ${sha_b}"
-  echo
-  echo '=== first differing byte (cmp) ==='
-  cmp "$img_a" "$img_b" || true
-  # Cap the byte enumeration: on a broad regression cmp -l would emit one line per
-  # differing byte across multi-GB images (billions of lines, hours). head closes
-  # the pipe early, so cmp stops at the cap.
-  cap=100000
-  n="$(cmp -l "$img_a" "$img_b" 2>/dev/null | head -n "$cap" | wc -l)"
-  [ "$n" -ge "$cap" ] && echo "differing byte count: >= ${cap} (capped)" \
-                      || echo "differing byte count: ${n}"
-  echo
-  echo '=== partition table diff (sfdisk -d) ==='
-  diff <(sfdisk -d "$img_a" 2>/dev/null) <(sfdisk -d "$img_b" 2>/dev/null) || true
-} > "$report" 2>&1
+rm -f "$report"
 
-# Register cleanup BEFORE allocating loop devices / mounts, so a failure part-way
-# through (e.g. mount A succeeds but mount B fails) does not leak an active mount, loop
-# devices or temp dirs into later CI jobs.
-loop_a='' ; loop_b='' ; mnt_a='' ; mnt_b=''
-# shellcheck disable=SC2317  # invoked indirectly via 'trap cleanup EXIT'
-cleanup() {
-  [ -n "$mnt_a" ] && mountpoint -q "$mnt_a" 2>/dev/null && sudo umount "$mnt_a" 2>/dev/null
-  [ -n "$mnt_b" ] && mountpoint -q "$mnt_b" 2>/dev/null && sudo umount "$mnt_b" 2>/dev/null
-  [ -n "$loop_a" ] && sudo losetup -d "$loop_a" 2>/dev/null
-  [ -n "$loop_b" ] && sudo losetup -d "$loop_b" 2>/dev/null
-  [ -n "$mnt_a" ] && rmdir "$mnt_a" 2>/dev/null
-  [ -n "$mnt_b" ] && rmdir "$mnt_b" 2>/dev/null
-  return 0
-}
-trap cleanup EXIT
-
-loop_a="$(sudo losetup -fP --show "$img_a")"
-loop_b="$(sudo losetup -fP --show "$img_b")"
-mnt_a="$(mktemp -d)"
-mnt_b="$(mktemp -d)"
-# The ext4 root is always the LAST partition: p1 on a plain msdos VM, p2 with a leading
-# ESP (arm64 GPT), p3 with ESP + bios_grub (amd64 GPT). Pick the highest-numbered one
-# rather than assuming p1/p2, so any layout localizes against the real root fs.
-root_a="$(printf '%s\n' "${loop_a}"p* | sort -V | tail -1)"
-root_b="$(printf '%s\n' "${loop_b}"p* | sort -V | tail -1)"
-if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; then
-  {
-    echo
-    echo '=== root filesystem: file content differences (diff -qr) ==='
-    # --no-dereference compares symlinks as symlinks; without it diff follows an
-    # absolute symlink (e.g. /etc/ssl/certs/*.pem) out of the mount and floods the
-    # report with spurious "No such file" lines.
-    sudo diff -qr --no-dereference "$mnt_a" "$mnt_b" 2>&1 | head -200
-    echo
-    echo '=== root filesystem: file mtime differences (epoch path) ==='
-    diff <(cd "$mnt_a" && sudo find . -printf '%T@ %p\n' | sort -k2) \
-         <(cd "$mnt_b" && sudo find . -printf '%T@ %p\n' | sort -k2) | head -200
-    echo
-    echo '=== content of each differing file (byte offsets + readable strings) ==='
-    sudo diff -qr --no-dereference "$mnt_a" "$mnt_b" 2>/dev/null \
-      | sed -n 's/^Files \(.*\) and \(.*\) differ$/\1|\2/p' \
-      | while IFS='|' read -r fa fb; do
-          echo "--- ${fa#"$mnt_a"} ($(sudo stat -c%s "$fa" 2>/dev/null) bytes) ---"
-          sudo cmp -l "$fa" "$fb" 2>&1 | head -20
-          # Readable-string delta. Use mktemp (not predictable /tmp names, which are
-          # symlink/TOCTOU-prone) and temp files rather than process substitution (a
-          # sudo'd diff cannot open the caller's /dev/fd/NN). sudo is only needed to
-          # READ the root-owned image files; the redirect target is user-owned.
-          sa="$(mktemp)" ; sb="$(mktemp)"
-          # shellcheck disable=SC2024
-          sudo strings "$fa" > "$sa" 2>/dev/null
-          # shellcheck disable=SC2024
-          sudo strings "$fb" > "$sb" 2>/dev/null
-          diff "$sa" "$sb" 2>&1 | head -30
-          rm -f "$sa" "$sb"
-        done
-  } >> "$report" 2>&1
-fi
-# Loop devices and mounts are released by the EXIT trap (cleanup).
+# diffoscope unpacks the raw images itself -- the partition table plus the ext4 root
+# filesystem (via libguestfs) -- and produces a recursive, format-aware per-file diff,
+# so no manual loop-mount is needed (and nothing to leak). Run the STREAMING diffoscope
+# from trixie-backports: trixie ships 297, which OOMs on a large DIFFERING member of
+# multi-GB images, whereas >= 302 streams the diff (diffoscope salsa issue #342). It
+# runs inside a debian:trixie --privileged container because backports is Debian-only
+# and libguestfs needs privileges + LIBGUESTFS_BACKEND=direct to launch its (KVM-less,
+# TCG) appliance. Bound the diff and keep the temp dir on real disk (TMPDIR=/var/tmp).
+# Diagnostic only: on any failure the script still exits 1 (the images differ) with
+# whatever report was produced.
+arch="$(dpkg --print-architecture)"
+docker run --privileged --rm -v "$(pwd)":/code -w /code debian:trixie bash -c '
+  set -eu
+  echo "deb http://deb.debian.org/debian trixie-backports main" \
+    > /etc/apt/sources.list.d/trixie-backports.list
+  apt-get update -qq
+  apt-get install --yes --no-install-recommends -t trixie-backports diffoscope
+  # Format descenders diffoscope needs to fully localize a grml root filesystem
+  # (diffoscope only WARNs on a missing one, so this list degrades gracefully):
+  #   - libguestfs-tools + a kernel: descend the raw disk image -> partitions -> the
+  #     ext4 root and the FAT ESP (the fs layer; the core of the diff).
+  #   - fakeroot: compare ownership / device nodes.
+  #   - binutils: readable ELF diffs for differing binaries (else a raw hexdump).
+  #   - xz-utils, zstd, gzip: transparently diff compressed members (man pages,
+  #     kernel modules) instead of reporting the whole compressed blob.
+  #   - xxd: hexdump fallback for any remaining binary member.
+  apt-get install --yes --no-install-recommends \
+    libguestfs-tools "linux-image-'"$arch"'" \
+    fakeroot binutils xz-utils zstd gzip xxd
+  export LIBGUESTFS_BACKEND=direct TMPDIR=/var/tmp
+  drc=0
+  diffoscope \
+    --max-diff-input-lines 100000 --max-diff-block-lines-saved 10000 \
+    --exclude "boot/initrd*" --exclude "boot/vmlinuz*" \
+    --text "/code/'"$report"'" "/code/'"$img_a"'" "/code/'"$img_b"'" || drc=$?
+  # diffoscope exits 0 (identical) or 1 (differ, report written); >1 is a real error.
+  [ "$drc" -le 1 ] || { echo "diffoscope error (rc=$drc)" >&2; exit "$drc"; }
+' || echo "diffoscope did not complete cleanly (see ${report} if present)." >&2
 
 echo "--- ${report} ---" >&2
-cat "$report" >&2
+if [ -f "$report" ]; then
+  cat "$report" >&2
+else
+  echo "(no diffoscope report was produced)" >&2
+fi
 exit 1
