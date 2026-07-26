@@ -30,14 +30,23 @@ cd "$here"
 img_a='repro-image-a.img'
 img_b='repro-image-b.img'
 
-echo "== reproducible-build: image A (SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}, ${RELEASE}/${TARGET}) =="
-QEMU_IMG="$img_a" ./tests/build-vm-and-test.sh run
+# Exit codes: 0 reproducible, 1 completed comparison that differs, 2 setup/build error.
+# A failed build cannot be compared, so it is a setup error (2), not a mismatch (1).
+build_image() {
+  echo "== reproducible-build: building '$1' (SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}, ${RELEASE}/${TARGET}) =="
+  if ! QEMU_IMG="$1" ./tests/build-vm-and-test.sh run; then
+    echo "reproducible-build: building '$1' failed -- setup/build error, not a reproducibility result." >&2
+    exit 2
+  fi
+}
+build_image "$img_a"
+build_image "$img_b"
 
-echo "== reproducible-build: image B (independent rebuild, same inputs) =="
-QEMU_IMG="$img_b" ./tests/build-vm-and-test.sh run
-
-sha_a="$(sha256sum "$img_a" | awk '{print $1}')"
-sha_b="$(sha256sum "$img_b" | awk '{print $1}')"
+if ! sha_a="$(sha256sum "$img_a" | awk '{print $1}')" \
+  || ! sha_b="$(sha256sum "$img_b" | awk '{print $1}')"; then
+  echo "reproducible-build: hashing the built images failed (setup error)." >&2
+  exit 2
+fi
 echo "A: ${sha_a}  ${img_a}"
 echo "B: ${sha_b}  ${img_b}"
 
@@ -74,6 +83,22 @@ report='reproducible-report.txt'
   echo '=== partition table diff (sfdisk -d) ==='
   diff <(sfdisk -d "$img_a" 2>/dev/null) <(sfdisk -d "$img_b" 2>/dev/null) || true
 } > "$report" 2>&1
+
+# Register cleanup BEFORE allocating loop devices / mounts, so a failure part-way
+# through (e.g. mount A succeeds but mount B fails) does not leak an active mount, loop
+# devices or temp dirs into later CI jobs.
+loop_a='' ; loop_b='' ; mnt_a='' ; mnt_b=''
+# shellcheck disable=SC2317  # invoked indirectly via 'trap cleanup EXIT'
+cleanup() {
+  [ -n "$mnt_a" ] && mountpoint -q "$mnt_a" 2>/dev/null && sudo umount "$mnt_a" 2>/dev/null
+  [ -n "$mnt_b" ] && mountpoint -q "$mnt_b" 2>/dev/null && sudo umount "$mnt_b" 2>/dev/null
+  [ -n "$loop_a" ] && sudo losetup -d "$loop_a" 2>/dev/null
+  [ -n "$loop_b" ] && sudo losetup -d "$loop_b" 2>/dev/null
+  [ -n "$mnt_a" ] && rmdir "$mnt_a" 2>/dev/null
+  [ -n "$mnt_b" ] && rmdir "$mnt_b" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
 
 loop_a="$(sudo losetup -fP --show "$img_a")"
 loop_b="$(sudo losetup -fP --show "$img_b")"
@@ -114,9 +139,8 @@ if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; t
           rm -f "$sa" "$sb"
         done
   } >> "$report" 2>&1
-  sudo umount "$mnt_a" "$mnt_b" || true
 fi
-sudo losetup -d "$loop_a" "$loop_b" || true
+# Loop devices and mounts are released by the EXIT trap (cleanup).
 
 echo "--- ${report} ---" >&2
 cat "$report" >&2

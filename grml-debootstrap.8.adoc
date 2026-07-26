@@ -319,7 +319,7 @@ grml-debootstrap can build bit-for-bit reproducible Virtual Machine images
 ecosystem; there is no separate on/off flag. Set it to a decimal integer in the
 range (0, INT64_MAX):
 
-  SOURCE_DATE_EPOCH=1767225600 grml-debootstrap --vm --vmfile \
+  SOURCE_DATE_EPOCH=1767225600 grml-debootstrap --vmfile \
     --target /tmp/disk.img --release trixie
 
 Disk and filesystem identifiers, the filesystem block layout and all embedded

@@ -835,10 +835,17 @@ fi
 # malformed value is a hard error rather than a silent non-reproducible build.
 REPRODUCIBLE_BUILD='no'
 if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
-  if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[0-9]+$ ]] \
-    || [ "${SOURCE_DATE_EPOCH}" -le 0 ] \
+  if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[0-9]+$ ]]; then
+    eerror "SOURCE_DATE_EPOCH is set to '${SOURCE_DATE_EPOCH}' but is not a decimal integer."
+    eerror "Unset it for a non-reproducible build, or set it to a valid value."
+    bailout 1
+  fi
+  # Force base-10: a leading zero would otherwise make bash's arithmetic (the -le/-ge
+  # tests and the XOR seeds below) parse the value as octal and abort on an 8 or 9.
+  SOURCE_DATE_EPOCH="$(( 10#${SOURCE_DATE_EPOCH} ))"
+  if [ "${SOURCE_DATE_EPOCH}" -le 0 ] \
     || [ "${SOURCE_DATE_EPOCH}" -ge 9223372036854775807 ]; then
-    eerror "SOURCE_DATE_EPOCH is set to '${SOURCE_DATE_EPOCH}' but is not a decimal integer in the range (0, INT64_MAX)."
+    eerror "SOURCE_DATE_EPOCH is '${SOURCE_DATE_EPOCH}' but must be a decimal integer in the range (0, INT64_MAX)."
     eerror "Unset it for a non-reproducible build, or set it to a valid value."
     bailout 1
   fi
@@ -847,11 +854,13 @@ if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
   # the chroot-script, ...) inherit it instead of it being passed explicitly.
   export SOURCE_DATE_EPOCH
 
-  mbr_id_from_seed "${SOURCE_DATE_EPOCH}" MBR_IDENTIFIER
+  # Derive each identifier from a DISTINCT seed so they do not resemble one another.
+  # bash's RANDOM is a deterministic PRNG (same seed -> same byte sequence), so seeding
+  # both mbr_id_from_seed and uuid_from_seed with SOURCE_DATE_EPOCH would make
+  # MBR_IDENTIFIER equal the first group of FS_IDENTIFIER. XOR with fixed, high-bit-clear
+  # masks keeps each seed a positive decimal integer (mbr/uuid_from_seed require that).
   uuid_from_seed "${SOURCE_DATE_EPOCH}" 5 FS_IDENTIFIER
-  # The GPT partition identifier should not resemble the FS identifier. To avoid
-  # confusion if multiple builds are kicked off in quick succession, it also should
-  # not simply be SOURCE_DATE_EPOCH + 1; XOR with a fixed value for a distinct seed.
+  mbr_id_from_seed "$(( SOURCE_DATE_EPOCH ^ 0x00ffffffffffffff ))" MBR_IDENTIFIER
   uuid_from_seed "$(( SOURCE_DATE_EPOCH ^ 0x0fffffffffffffff ))" 4 \
     GPT_IDENTIFIER_PREFIX
 
@@ -927,14 +936,23 @@ fi
 # times, so a reproducible build is impossible -- refuse rather than emit a
 # silently non-reproducible image.
 if [ "${REPRODUCIBLE_BUILD}" = 'yes' ]; then
-  e2fsprogs_version="$(dpkg-query --show --showformat='${Version}' e2fsprogs 2>/dev/null || true)"
-  if [ -z "${e2fsprogs_version}" ]; then
-    eerror "Cannot determine the e2fsprogs version; reproducible builds require e2fsprogs >= 1.44.0."
-    bailout 1
-  fi
-  if ! dpkg --compare-versions "${e2fsprogs_version}" ge '1.44.0'; then
-    eerror "Reproducible builds require e2fsprogs >= 1.44.0 (mke2fs SOURCE_DATE_EPOCH support), but ${e2fsprogs_version} is installed."
-    bailout 1
+  if echo "$MKFS" | grep -q "mkfs.ext"; then
+    e2fsprogs_version="$(dpkg-query --show --showformat='${Version}' e2fsprogs 2>/dev/null || true)"
+    if [ -z "${e2fsprogs_version}" ]; then
+      eerror "Cannot determine the e2fsprogs version; reproducible builds require e2fsprogs >= 1.44.0."
+      bailout 1
+    fi
+    if ! dpkg --compare-versions "${e2fsprogs_version}" ge '1.44.0'; then
+      eerror "Reproducible builds require e2fsprogs >= 1.44.0 (mke2fs SOURCE_DATE_EPOCH support), but ${e2fsprogs_version} is installed."
+      bailout 1
+    fi
+  else
+    # The reproducible root-filesystem re-image is ext-only (reimage_root_filesystem /
+    # normalize_root_superblock gate on mkfs.ext). With a non-ext MKFS only the disk and
+    # partition identifiers are made deterministic; the root filesystem layout and
+    # timestamps are NOT reproducible. Warn rather than bail, since deterministic IDs
+    # may still be wanted.
+    ewarn "Reproducible build requested but MKFS is '${MKFS}' (not ext): only disk/partition identifiers are deterministic, the root filesystem is NOT reproducible. Use an ext filesystem for a fully reproducible image."
   fi
 fi
 # }}}
