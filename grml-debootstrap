@@ -51,6 +51,7 @@ MNTPOINT="/mnt/debootstrap.$$"
 [ -n "$DEFAULT_LANGUAGE" ] || DEFAULT_LANGUAGE='en_US:en'
 [ -n "$DEFAULT_LOCALES" ] || DEFAULT_LOCALES='en_US.UTF-8'
 [ -n "$FS_IDENTIFIER" ] || FS_IDENTIFIER='00000000-0000-0000-0000-000000000000'
+[ -n "$HASH_SEED" ] || HASH_SEED='00000000-0000-0000-0000-000000000000'
 [ -n "$GPT_IDENTIFIER_PREFIX" ] || GPT_IDENTIFIER_PREFIX='00000000-0000-0000-0000'
 [ -n "$MBR_IDENTIFIER" ] || MBR_IDENTIFIER='0x00000000'
 [ -n "$EXTRAPACKAGES" ] || EXTRAPACKAGES='yes'
@@ -863,6 +864,10 @@ if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
   mbr_id_from_seed "$(( SOURCE_DATE_EPOCH ^ 0x00ffffffffffffff ))" MBR_IDENTIFIER
   uuid_from_seed "$(( SOURCE_DATE_EPOCH ^ 0x0fffffffffffffff ))" 4 \
     GPT_IDENTIFIER_PREFIX
+  # The mke2fs directory hash seed is a separate identifier from the fs UUID; derive it
+  # from its own seed rather than reusing FS_IDENTIFIER (reusing one value for two
+  # purposes invites confusion and subtle bugs).
+  uuid_from_seed "$(( SOURCE_DATE_EPOCH ^ 0x000fffffffffffff ))" 5 HASH_SEED
 
   # SECURITY: with a root password set, the crypt() salt is derived from
   # ROOTPASSWORD_SEED (see chroot-script). If it is unset the salt falls back to
@@ -1480,19 +1485,17 @@ mkfs() {
 
   # Pin the ext4 directory hash seed and filesystem UUID so mke2fs lays out metadata
   # deterministically (a random hash seed also drives htree ordering, cascading into
-  # different block allocation). MKFS_OPTS is reused by the offline re-image
-  # (reimage_root_filesystem), where these actually deliver reproducibility; setting
-  # them here too makes the initial filesystem's UUID equal FS_IDENTIFIER, which
-  # reimage_root_filesystem then asserts.
-  #
-  # Disable metadata_csum_seed: specifying -U with metadata_csum otherwise makes
-  # mke2fs enable the CSUM_SEED incompat feature (a checksum seed decoupled from the
-  # UUID). That is still reproducible under SOURCE_DATE_EPOCH, but GRUB's ext2 module
-  # cannot read a CSUM_SEED filesystem, so the re-imaged root drops the boot to
-  # "grub rescue>". With it off, the seed follows the fixed UUID -- reproducible AND
-  # bootable. Requires mke2fs >= 1.44, guaranteed by the reproducible-build guard.
+  # different block allocation). The hash seed comes from its own derived value
+  # (HASH_SEED), kept distinct from the UUID so one value never serves two purposes.
+  # MKFS_OPTS is reused verbatim by the offline re-image (reimage_root_filesystem),
+  # where these actually deliver reproducibility; setting them here too makes the
+  # initial filesystem's UUID equal FS_IDENTIFIER, which reimage_root_filesystem then
+  # asserts. metadata_csum_seed is left at the mke2fs default: -U enables the CSUM_SEED
+  # incompat feature (a checksum seed decoupled from the UUID), which is reproducible
+  # under SOURCE_DATE_EPOCH and -- verified by a full BIOS boot of the re-imaged root --
+  # grub-bootable, so no ^metadata_csum_seed override is needed.
   if [ "$REPRODUCIBLE_BUILD" = 'yes' ] && echo "$MKFS" | grep -q "mkfs.ext"; then
-    MKFS_OPTS="$MKFS_OPTS -E hash_seed=$FS_IDENTIFIER -U $FS_IDENTIFIER -O ^metadata_csum_seed"
+    MKFS_OPTS="$MKFS_OPTS -E hash_seed=$HASH_SEED -U $FS_IDENTIFIER"
   fi
 
   if [ -n "$MKFS" ] ; then
