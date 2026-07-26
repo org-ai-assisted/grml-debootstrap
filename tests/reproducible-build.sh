@@ -104,9 +104,11 @@ loop_a="$(sudo losetup -fP --show "$img_a")"
 loop_b="$(sudo losetup -fP --show "$img_b")"
 mnt_a="$(mktemp -d)"
 mnt_b="$(mktemp -d)"
-# The ext4 root is the last partition (p1 on a plain msdos VM, p2 when an ESP precedes it).
-root_a="${loop_a}p1" ; root_b="${loop_b}p1"
-if [ -e "${loop_a}p2" ]; then root_a="${loop_a}p2" ; root_b="${loop_b}p2" ; fi
+# The ext4 root is always the LAST partition: p1 on a plain msdos VM, p2 with a leading
+# ESP (arm64 GPT), p3 with ESP + bios_grub (amd64 GPT). Pick the highest-numbered one
+# rather than assuming p1/p2, so any layout localizes against the real root fs.
+root_a="$(printf '%s\n' "${loop_a}"p* | sort -V | tail -1)"
+root_b="$(printf '%s\n' "${loop_b}"p* | sort -V | tail -1)"
 if sudo mount -o ro "$root_a" "$mnt_a" && sudo mount -o ro "$root_b" "$mnt_b"; then
   {
     echo
