@@ -28,10 +28,16 @@ trap "error_handler" ERR
 
 bash -n /etc/debootstrap/config
 # shellcheck source=config
-. /etc/debootstrap/config    || exit 1
+if ! . /etc/debootstrap/config ; then
+  echo "Error: failed to source /etc/debootstrap/config" >&2
+  exit 1
+fi
 bash -n /etc/debootstrap/variables
 # shellcheck source=tests/shellcheck-stub-debootstrap-variables
-. /etc/debootstrap/variables || exit 1
+if ! . /etc/debootstrap/variables ; then
+  echo "Error: failed to source /etc/debootstrap/variables" >&2
+  exit 1
+fi
 
 # Export SOURCE_DATE_EPOCH so every child process honours it (mkinitramfs, dpkg,
 # and other SOURCE_DATE_EPOCH-aware tools) -- required for a reproducible image.
