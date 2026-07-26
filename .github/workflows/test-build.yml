@@ -210,3 +210,40 @@ jobs:
         path: reproducible-report.txt
         if-no-files-found: warn
         retention-days: 14
+
+  firmware-boot:
+    # Prove the built image boots under all three amd64 firmware modes: BIOS
+    # (SeaBIOS), UEFI (OVMF) and UEFI+Secure Boot (OVMF, Microsoft keys enrolled).
+    # Builds ONE EFI-capable image (VMEFI=1 -> GPT + ESP + bios_grub, grub-cloud +
+    # signed shim/grub) and boots it once per firmware via tests/test-vm.sh. amd64
+    # only: arm64 is UEFI-only and already covered by the normal VM test.
+    needs: build-debian
+    name: "Boot image under BIOS / UEFI / UEFI+SecureBoot (amd64, trixie)"
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Download built deb
+      uses: actions/download-artifact@v8
+      with:
+        name: deb-trixie
+
+    - run: ./tests/build-vm-and-test.sh setup
+      name: "Setup test environment (qemu, ovmf, goss)"
+
+    - run: ./tests/firmware-boot-test.sh
+      name: "Build EFI-capable image and boot under 3 firmwares"
+      env:
+        HOST_RELEASE: trixie
+        RELEASE: trixie
+
+    - name: Archive firmware boot results
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: firmware-boot-results
+        path: tests/results/
+        if-no-files-found: warn
+        retention-days: 14

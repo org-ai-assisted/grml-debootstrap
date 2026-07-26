@@ -103,6 +103,7 @@ if [ "$1" == "run" ]; then
     -v "$(pwd)":/code \
     -e TERM="$TERM" \
     -e SOURCE_DATE_EPOCH \
+    -e VMEFI \
     -w /code \
     debian:"$HOST_RELEASE" \
     bash -c './tests/docker-install-deb.sh '"$DEB_NAME"' && ./tests/docker-build-vm.sh '"$(id -u)"' '"/code/$QEMU_IMG"' '"$RELEASE"' '"$TARGET"

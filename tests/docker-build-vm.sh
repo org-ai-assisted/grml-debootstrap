@@ -28,6 +28,12 @@ if [ "$TARGET" = 'RPI' ]; then
   extra_buildopts=(--rpifile --non-free)
 else
   extra_buildopts=(--vmfile)
+  # VMEFI=1 builds a GPT image with an ESP + bios_grub partition (grub-cloud +
+  # signed shim/grub), so the same image is bootable on BIOS, UEFI and UEFI+Secure
+  # Boot -- required for the 3-firmware boot test (tests/firmware-boot-test.sh).
+  if [ "${VMEFI:-}" = '1' ] && [ "$(dpkg --print-architecture)" = 'amd64' ]; then
+    extra_buildopts+=(--vmefi)
+  fi
 fi
 
 # arm64 'virt' machines expose a pl011 UART as ttyAMA0 with no VGA console;
