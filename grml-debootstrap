@@ -2103,6 +2103,7 @@ preparechroot() {
   [ -n "$DEBIAN_FRONTEND" ]           && echo "DEBIAN_FRONTEND='${DEBIAN_FRONTEND//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$DEFAULT_LOCALES" ]           && echo "DEFAULT_LOCALES='${DEFAULT_LOCALES//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$DEFAULT_LANGUAGE" ]          && echo "DEFAULT_LANGUAGE='${DEFAULT_LANGUAGE//\'/\'\\\'\'}'"                 >> "$CHROOT_VARIABLES"
+  [ -n "$DPKG_OPTIONS" ]              && echo "DPKG_OPTIONS='${DPKG_OPTIONS//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
   [ -n "$EXTRAPACKAGES" ]             && echo "EXTRAPACKAGES='${EXTRAPACKAGES//\'/\'\\\'\'}'"                       >> "$CHROOT_VARIABLES"
   [ -n "$EFI" ]                       && echo "EFI='${EFI//\'/\'\\\'\'}'"                                           >> "$CHROOT_VARIABLES"
   [ -n "$FALLBACK_MIRROR" ]           && echo "FALLBACK_MIRROR='${FALLBACK_MIRROR//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
