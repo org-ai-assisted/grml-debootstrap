@@ -1932,12 +1932,12 @@ reimage_root_filesystem() {
 
 # pin the root filesystem superblock timestamps {{{
 normalize_root_superblock() {
-  # Rewrite the superblock via debugfs after the offline re-image. This is required
-  # for the re-imaged root to boot: without it grub-pc (BIOS) drops to "grub rescue>"
-  # because mke2fs -d leaves the superblock in a state grub's ext2 reader rejects;
-  # debugfs -w opens the fs read-write and finalizes the superblock cleanly on close.
-  # It also pins the last-mount / write / check times and the lifetime-writes counter
-  # to SOURCE_DATE_EPOCH. Times are hex because debugfs misparses large decimals.
+  # Required for byte-for-byte reproducibility: mke2fs -d leaves the superblock's
+  # last-mount / write / check times and the lifetime-writes counter at build-varying
+  # values, so two builds differ without this step (verified: removing it makes the
+  # reproducible-build comparison fail, while the image still boots fine). Pin them to
+  # SOURCE_DATE_EPOCH (and 0) with debugfs. Times are hex because debugfs misparses
+  # large decimals.
   local sde_hex sde_cmd debugfs_err
   einfo "Normalizing the root filesystem superblock"
   sde_hex="$(printf '0x%x' "${SOURCE_DATE_EPOCH}")"
@@ -1983,8 +1983,8 @@ umount_target() {
 
   try_umount 3 "${MNTPOINT}"
 
-  # Re-image offline with mke2fs -d, then normalize the superblock (required for the
-  # re-imaged root to be grub-bootable, and pins the remaining timestamps).
+  # Re-image offline with mke2fs -d for deterministic block allocation, then pin the
+  # superblock timestamps mke2fs -d leaves build-varying (needed for reproducibility).
   if [ "${REPRODUCIBLE_BUILD}" = 'yes' ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] \
      && echo "$MKFS" | grep -q "mkfs.ext"; then
     reimage_root_filesystem
