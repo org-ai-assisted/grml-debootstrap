@@ -1839,9 +1839,9 @@ make_esp_reproducible() {
 
 # snapshot the populated root filesystem before it is unmounted {{{
 # reimage_tree is a global: snapshot_root_filesystem fills it (while the root fs is
-# still mounted at MNTPOINT) and reimage_root_filesystem consumes it (once the
-# device is unmounted). Copying from the existing mount rather than a fresh mount of
-# the same device avoids a 'device already mounted' failure.
+# still mounted) and reimage_root_filesystem consumes it (once the device is
+# unmounted). Copying from the existing mount rather than a fresh mount of the same
+# device avoids a 'device already mounted' failure.
 reimage_tree=''
 snapshot_root_filesystem() {
   local reimage_parent
@@ -1854,12 +1854,24 @@ snapshot_root_filesystem() {
     reimage_parent="${TMPDIR:-/tmp}"
   fi
   reimage_tree="$(mktemp -d -p "${reimage_parent}")"
-  # The root filesystem is mounted at MNTPOINT here: umount_target snapshots before
-  # it unmounts MNTPOINT, and the rest of grml-debootstrap already relies on the root
-  # being at MNTPOINT. Copy from that live mount with --one-file-system so the
-  # pseudo-filesystems still mounted under it (/proc, /sys, /dev) are not descended
-  # into. cp -a preserves everything mke2fs -d relies on.
-  cp -a --one-file-system "${MNTPOINT}/." "${reimage_tree}/"
+  # Locate where the root device is actually mounted right now and copy from that live
+  # mount with --one-file-system, so pseudo-filesystems still mounted under it (/proc,
+  # /sys, /dev) are not descended into. Do NOT assume MNTPOINT: by this point the root
+  # may be mounted elsewhere (or not at MNTPOINT), and copying a bare MNTPOINT that is
+  # no longer the mount yields an empty tree -> a re-imaged fs missing /boot/grub ->
+  # "grub rescue> ... normal.mod not found". If it is already unmounted, fall back to a
+  # fresh read-only mount. cp -a preserves everything mke2fs -d relies on.
+  local src reimage_mnt
+  src="$(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null | head -1 || true)"
+  if [ -n "${src}" ]; then
+    cp -a --one-file-system "${src}/." "${reimage_tree}/"
+  else
+    reimage_mnt="$(mktemp -d)"
+    mount -o ro "${TARGET}" "${reimage_mnt}"
+    cp -a "${reimage_mnt}/." "${reimage_tree}/"
+    umount "${reimage_mnt}"
+    rmdir "${reimage_mnt}"
+  fi
 }
 # }}}
 
@@ -1918,6 +1930,35 @@ reimage_root_filesystem() {
 }
 # }}}
 
+# pin the root filesystem superblock timestamps {{{
+normalize_root_superblock() {
+  # Rewrite the superblock via debugfs after the offline re-image. This is required
+  # for the re-imaged root to boot: without it grub-pc (BIOS) drops to "grub rescue>"
+  # because mke2fs -d leaves the superblock in a state grub's ext2 reader rejects;
+  # debugfs -w opens the fs read-write and finalizes the superblock cleanly on close.
+  # It also pins the last-mount / write / check times and the lifetime-writes counter
+  # to SOURCE_DATE_EPOCH. Times are hex because debugfs misparses large decimals.
+  local sde_hex sde_cmd debugfs_err
+  einfo "Normalizing the root filesystem superblock"
+  sde_hex="$(printf '0x%x' "${SOURCE_DATE_EPOCH}")"
+  # Field names carry no 's_' prefix; an 's_'-prefixed name is rejected outright.
+  for sde_cmd in "set_super_value mtime ${sde_hex}" \
+                 "set_super_value wtime ${sde_hex}" \
+                 "set_super_value lastcheck ${sde_hex}" \
+                 "set_super_value kbytes_written 0"; do
+    # debugfs exits 0 even when set_super_value fails internally, so inspect its
+    # stderr and bail out on a real error.
+    debugfs_err="$(debugfs -w -R "${sde_cmd}" "${TARGET}" 2>&1 1>/dev/null)"
+    case "${debugfs_err}" in
+      *"set_super_value:"*)
+        eerror "debugfs rejected '${sde_cmd}' on ${TARGET}: ${debugfs_err}"
+        bailout 1
+        ;;
+    esac
+  done
+}
+# }}}
+
 # unmount VM image {{{
 umount_target() {
   if [ -z "${VIRTUAL}" ] ; then
@@ -1942,13 +1983,12 @@ umount_target() {
 
   try_umount 3 "${MNTPOINT}"
 
-  # Re-image offline with mke2fs -d; the freshly created filesystem is never remounted
-  # afterwards, so its superblock timestamps stay SOURCE_DATE_EPOCH-derived and no
-  # debugfs post-processing is needed (the too-old-e2fsprogs guard above ensures
-  # mke2fs honours SOURCE_DATE_EPOCH).
+  # Re-image offline with mke2fs -d, then normalize the superblock (required for the
+  # re-imaged root to be grub-bootable, and pins the remaining timestamps).
   if [ "${REPRODUCIBLE_BUILD}" = 'yes' ] && [ -n "$TARGET" ] && [ -b "$TARGET" ] \
      && echo "$MKFS" | grep -q "mkfs.ext"; then
     reimage_root_filesystem
+    normalize_root_superblock
   fi
 
   kpartx -d "${ORIG_TARGET}" >/dev/null
