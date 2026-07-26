@@ -18,7 +18,9 @@ TARGET="$4"
 
 set -x
 
-MIRROR='https://deb.debian.org/debian'
+# Honour a MIRROR passed in (e.g. a local apt cache via APT_CACHE_MIRROR); default to
+# the public mirror when empty/unset, so CI and normal runs are unchanged.
+MIRROR="${MIRROR:-https://deb.debian.org/debian}"
 
 
 echo " ****************************************************************** "

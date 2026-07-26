@@ -99,11 +99,21 @@ if [ "$1" == "run" ]; then
   # (tests/reproducible-build.sh) can request a deterministic build; it is the sole
   # reproducible-build switch and is unset in a normal test-build, leaving behaviour
   # unchanged.
+  # Opt-in local apt cache: set APT_CACHE_MIRROR to a caching mirror (e.g. an approx or
+  # apt-cacher-ng URL) to speed up repeated local builds. It is passed through as MIRROR
+  # and the container joins the host network so it can reach a cache on the host. Unset
+  # (CI, normal runs) -> default bridge network + the built-in mirror, behaviour unchanged.
+  docker_extra=()
+  if [ -n "${APT_CACHE_MIRROR:-}" ]; then
+    docker_extra+=(--network host)
+  fi
   exec docker run --privileged --rm -i \
+    "${docker_extra[@]}" \
     -v "$(pwd)":/code \
     -e TERM="$TERM" \
     -e SOURCE_DATE_EPOCH \
     -e VMEFI \
+    -e MIRROR="${APT_CACHE_MIRROR:-}" \
     -w /code \
     debian:"$HOST_RELEASE" \
     bash -c './tests/docker-install-deb.sh '"$DEB_NAME"' && ./tests/docker-build-vm.sh '"$(id -u)"' '"/code/$QEMU_IMG"' '"$RELEASE"' '"$TARGET"
