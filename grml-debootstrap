@@ -1868,7 +1868,7 @@ reimage_root_filesystem() {
   # below reuses MKFS_OPTS (same -U), so fstab/bootloader references stay valid.
   # Reproducibility depends on that UUID being FS_IDENTIFIER; if it is not, the image
   # would build but not reproduce, so bail rather than ship a non-reproducible image.
-  current_uuid="$(blkid -o value -s UUID "${TARGET}")"
+  current_uuid="$(blkid -o value -s UUID "${TARGET}" 2>/dev/null || true)"
   if [ "${current_uuid}" != "${FS_IDENTIFIER}" ]; then
     eerror "Root filesystem UUID '${current_uuid}' does not match FS_IDENTIFIER '${FS_IDENTIFIER}'; refusing to re-image ${TARGET} non-reproducibly."
     bailout 1
@@ -1879,8 +1879,12 @@ reimage_root_filesystem() {
   # is only safe before an imminent reboot).
   tries=0
   while true; do
+    # findmnt exits 1 when the source has no mountpoints -- the success case here.
+    # grml-debootstrap runs under errexit with an ERR trap (error_handler), and a
+    # bare non-zero inside the process substitution would trip it and capture the
+    # trap's diagnostic text as bogus mountpoints; '|| true' keeps that exit benign.
     readarray -t mountpoint_list \
-      < <(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null)
+      < <(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null || true)
     if [ "${#mountpoint_list[@]}" -eq 0 ]; then
       break
     fi
