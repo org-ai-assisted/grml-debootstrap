@@ -1465,10 +1465,16 @@ mkfs() {
   # different block allocation). MKFS_OPTS is reused by the offline re-image
   # (reimage_root_filesystem), where these actually deliver reproducibility; setting
   # them here too makes the initial filesystem's UUID equal FS_IDENTIFIER, which
-  # reimage_root_filesystem then asserts. mke2fs derives metadata_csum_seed
-  # deterministically from SOURCE_DATE_EPOCH, so it needs no special handling.
+  # reimage_root_filesystem then asserts.
+  #
+  # Disable metadata_csum_seed: specifying -U with metadata_csum otherwise makes
+  # mke2fs enable the CSUM_SEED incompat feature (a checksum seed decoupled from the
+  # UUID). That is still reproducible under SOURCE_DATE_EPOCH, but GRUB's ext2 module
+  # cannot read a CSUM_SEED filesystem, so the re-imaged root drops the boot to
+  # "grub rescue>". With it off, the seed follows the fixed UUID -- reproducible AND
+  # bootable. Requires mke2fs >= 1.44, guaranteed by the reproducible-build guard.
   if [ "$REPRODUCIBLE_BUILD" = 'yes' ] && echo "$MKFS" | grep -q "mkfs.ext"; then
-    MKFS_OPTS="$MKFS_OPTS -E hash_seed=$FS_IDENTIFIER -U $FS_IDENTIFIER"
+    MKFS_OPTS="$MKFS_OPTS -E hash_seed=$FS_IDENTIFIER -U $FS_IDENTIFIER -O ^metadata_csum_seed"
   fi
 
   if [ -n "$MKFS" ] ; then
