@@ -33,6 +33,9 @@ bash -n /etc/debootstrap/variables
 # shellcheck source=tests/shellcheck-stub-debootstrap-variables
 . /etc/debootstrap/variables || exit 1
 
+# Make sure all tools see SOURCE_DATE_EPOCH if it's available
+[ -n "${SOURCE_DATE_EPOCH:-}" ] && export SOURCE_DATE_EPOCH
+
 [ -r /proc/1 ] || mount -t proc none /proc
 [ -r /sys/kernel ] || mount -t sysfs none /sys
 
@@ -406,9 +409,22 @@ passwords()
   fi
 
   if [ -n "$ROOTPASSWORD" ] ; then
-     # shellcheck disable=SC2086
-     echo root:"$ROOTPASSWORD" | chpasswd
-     export ROOTPASSWORD=''
+    if [ -v SOURCE_DATE_EPOCH ]; then
+      local pass_hash
+      pass_hash="$(perl -e \
+        'print crypt($ARGV[0], "\$y\$j9T\$".$ARGV[1]."\$")' \
+        "$ROOTPASSWORD" "$ROOTPASSWORD_SALT")"
+      # Regex taken from the 'yescrypt' section of 'man 5 crypt'
+      if ! [[ "${pass_hash}" =~ \$y\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{,86}\$[./A-Za-z0-9]{43} ]]; then
+        echo "Error: failed to generate a reproducible password hash."
+        exit 1
+      fi
+      echo "root:${pass_hash}" | chpasswd -e
+    else
+      # shellcheck disable=SC2086
+      echo root:"$ROOTPASSWORD" | chpasswd
+    fi
+    export ROOTPASSWORD=''
   else
     a='1'
     b='2'
@@ -489,8 +505,14 @@ timezone() {
 # shellcheck disable=SC2329
 createfstab(){
   echo "Setting up /etc/fstab"
+  local fstab_created_on
+  if [ -v SOURCE_DATE_EPOCH ]; then
+    fstab_created_on="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}")"
+  else
+    fstab_created_on="$(date)"
+  fi
   cat > /etc/fstab <<EOF
-# /etc/fstab - created by grml-debootstrap on $(date)
+# /etc/fstab - created by grml-debootstrap on ${fstab_created_on}
 # Accessible filesystems, by reference, are maintained under '/dev/disk/'.
 # See man pages fstab(5), findfs(8), mount(8) and/or blkid(8) for more info.
 #
@@ -711,19 +733,14 @@ is_grub_bios_compatible() {
     return 0
   # Look for a BIOS boot partition otherwise
   else
-    SEARCH_STR="$GRUB"
-    if [[ "$SEARCH_STR" =~ ^/dev/loop ]]; then
-      SEARCH_STR="${SEARCH_STR//\/dev\//}" # loopX
-      SEARCH_STR="/dev/mapper/${SEARCH_STR}" # /dev/mapper/loopX
-      # Note that /dev/mapper/loopX won't actually exist, but
-      # /dev/mapper/loopXpY will, so this works for the regex check in the
-      # while loop below.
+    # Scanning the output of lsblk is unreliable in some environments. partx
+    # seems to work better.
+    local partx_types
+    partx_types="$(partx --show --noheadings --output TYPE "$GRUB")"
+    if [[ "${partx_types}" \
+      =~ (^|$'\n')21686148-6449-6e6f-744e-656564454649($'\n'|$) ]]; then
+      return 0
     fi
-    while read -r line; do
-      if [[ "$line" =~ ^${SEARCH_STR}.*21686148-6449-6e6f-744e-656564454649$ ]]; then
-        return 0
-      fi
-    done < <(lsblk -pnlo NAME,PARTTYPE)
   fi
   return 1
 }
@@ -885,6 +902,50 @@ finalize() {
 }
 # }}}
 
+# reproducible-build finalization {{{
+reproducible_finalize() {
+  [ -v SOURCE_DATE_EPOCH ] || return 0
+  echo "Applying reproducible-build finalization."
+
+  # SSH host keys
+  rm -f /etc/ssh/ssh_host_*
+
+  # Postfix aliases.db
+  # TODO: Simply deleting this file may cause problems for the system
+  # admnistrator later. Modifying it requires adding db-util to the image.
+  # Regenerating it with a fixed timestamp seems to be impossible (newaliases
+  # does not support it, and running newaliases under 'faketime -f' causes it
+  # to freeze indefinitely).
+  rm -f /etc/aliases.db
+
+  # machine-id
+  printf 'uninitialized\n' > /etc/machine-id
+  rm -f /var/lib/dbus/machine-id # copied from /etc/machine-id on boot
+
+  # logs
+  rm -f /var/log/alternatives.log /var/log/dpkg.log /var/log/apt/history.log \
+    /var/log/apt/term.log
+
+  # ldconfig auxiliary cache (this seems to be undocumented, ldconfig
+  # regenerates it)
+  rm -f /var/cache/ldconfig/aux-cache
+
+  # files that shouldn't have gotten stuck in /run but did anyway
+  local rm_run_obj
+  for rm_run_obj in /run/*; do
+    if [ -e "${rm_run_obj}" ] && [ "${rm_run_obj}" != '/run/udev' ]; then
+      rm -rf "${rm_run_obj}"
+    fi
+  done
+
+  # locale configuration, lines may be in a nondeterministic order
+  [ -f /etc/locale.conf ] && LC_ALL=C sort -o /etc/locale.conf /etc/locale.conf
+
+  # our own grml-debootstrap configuration
+  rm -f /etc/debootstrap/config
+}
+# }}}
+
 # signal handler {{{
 # shellcheck disable=SC2329
 signal_handler() {
@@ -908,7 +969,7 @@ trap signal_handler HUP INT QUIT TERM
      default_locales timezone fstab install_fs_tools hostname \
      initrd grub_install passwords \
      custom_scripts upgrade_system rpi_cmdline remove_apt_cache services \
-     remove_chrootmirror; do
+     remove_chrootmirror reproducible_finalize; do
      if stage "$i" ; then
        "$i"
        stage "$i" 'done'
