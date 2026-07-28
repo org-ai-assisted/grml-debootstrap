@@ -35,10 +35,14 @@ trap "error_handler" ERR
 
 # variables {{{
 PN="$(basename "$0")"
+# Both lookups are allowed to fail -- the VERSION fallback below is what handles
+# that, and it is only reachable if they do not abort under errexit first. A git
+# checkout without tags (a shallow CI clone, a fresh clone before tags arrive)
+# makes 'git describe' fail, which otherwise kills the script on startup.
 if [[ -d "$(dirname "$(command -v "$0")")"/.git ]]; then
-  VERSION="$(git --git-dir "$(dirname "$(command -v "$0")")"/.git describe | sed 's|^v||')"
+  VERSION="$(git --git-dir "$(dirname "$(command -v "$0")")"/.git describe 2>/dev/null | sed 's|^v||')" || true
 else
-  VERSION="$(dpkg-query --show --showformat='${Version}' "$PN")"
+  VERSION="$(dpkg-query --show --showformat='${Version}' "$PN" 2>/dev/null)" || true
 fi
 VERSION="${VERSION:-unknown}"
 MNTPOINT="/mnt/debootstrap.$$"
