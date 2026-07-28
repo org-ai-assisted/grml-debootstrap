@@ -867,6 +867,15 @@ if [ "$RPI" ] && [ -z "$ARCH" ]; then
   ARCH='arm64'
 fi
 
+# Resolve the architecture here rather than only in the architecture setup block
+# further down: HAS_FWBOOT_PART below, and the mcopy/mdir check for reproducible
+# builds, both branch on it, and an unset ARCH made them read as "not arm64".
+# arm64 VM builds get VMEFI=1 (and thus a real ESP) inside prepare_image, so the
+# ESP went unregistered and was never rebuilt deterministically. Kept after the
+# Raspberry Pi block above, which pins arm64 for cross-builds. Failure stays
+# silent so the existing diagnostic below still reports an unresolvable arch.
+[ -n "$ARCH" ] || ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
+
 if [ -n "${EFI}" ] \
   || [ "${VMEFI}" = '1' ] \
   || [ -n "${RPIFIRM}" ] \
@@ -965,8 +974,13 @@ if [ -v SOURCE_DATE_EPOCH ] ; then
     bailout 1
   fi
   # Bash only supports 64-bit signed integers; if SOURCE_DATE_EPOCH is greater
-  # than INT64_MAX, it will wrap around and become negative.
-  if (( SOURCE_DATE_EPOCH < 0 )) ; then
+  # than INT64_MAX, it will wrap around and become negative. The wraparound check
+  # alone is not enough: at 2**64 and its multiples the value wraps back to 0 (or
+  # to some other positive number), which is not negative and would reach the
+  # build, where arithmetic contexts and date/touch/printf then disagree about
+  # what it means. INT64_MAX has 19 digits, so anything longer is out of range
+  # whatever it wraps to.
+  if [ "${#SOURCE_DATE_EPOCH}" -gt 19 ] || (( SOURCE_DATE_EPOCH < 0 )) ; then
     eerror "SOURCE_DATE_EPOCH is larger than INT64_MAX. Please unset it or set it to a smaller decimal integer."
     bailout 1
   fi
@@ -2008,13 +2022,48 @@ reimage_root_filesystem() {
     bailout 1
   fi
 
-  # If TARGET is still mounted somewhere, mkfs.ext4 will refuse to overwrite
-  # it since -F is only passed once.
+  # --force already appended -F to MKFS_OPTS, so the -F below is the *second*
+  # one, and two -F tell mke2fs to format even while mounted -- it will not
+  # refuse. try_umount above only handles $MNTPOINT, but the target can be
+  # mounted elsewhere too (udisks picking up the kpartx mapper node, a stale
+  # manual mount, a systemd mount unit), so clear every mountpoint it has.
+  local target_mountpoints mountpoint umount_tries
+  umount_tries=0
+  while true ; do
+    # findmnt exits 1 when the source has no mountpoints at all, which is the
+    # success case here; keep that benign under errexit and the ERR trap.
+    readarray -t target_mountpoints \
+      < <(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null || true)
+    [ "${#target_mountpoints[@]}" -eq 0 ] && break
+    if [ "${umount_tries}" -ge 10 ] ; then
+      eerror "Failed to unmount '${TARGET}' after 10 attempts, refusing to re-image it!"
+      bailout 1
+    fi
+    for mountpoint in "${target_mountpoints[@]}" ; do
+      umount "${mountpoint}" 2>/dev/null || true
+    done
+    umount_tries=$(( umount_tries + 1 ))
+    sleep 1
+  done
+
   # shellcheck disable=SC2086
   "${MKFS}" ${MKFS_OPTS} -d "${ROOTFS_REIMAGE_TREE}" -F "${TARGET}"
   rm -rf "${ROOTFS_REIMAGE_TREE}"
   ROOTFS_REIMAGE_TREE=''
   tunefs
+}
+# }}}
+
+# does the reproducible post-processing apply to this build? {{{
+reproducible_image_build() {
+  # The snapshot / re-image / ESP-rebuild path rewrites the target filesystem
+  # wholesale from a staging copy. That is fine for a VM or Raspberry Pi image
+  # file, but $PARTITION alone is also true for a bare-metal install onto a real
+  # block device, where it would mkfs over the user's disk at the very end of an
+  # otherwise finished install. Restrict it to image builds, the same way the
+  # kpartx teardown in umount_chroot is restricted.
+  [ -v SOURCE_DATE_EPOCH ] || return 1
+  [ -n "${VIRTUAL}" ] || [ -n "${RPI}" ]
 }
 # }}}
 
@@ -2453,18 +2502,18 @@ umount_chroot() {
 
   try_umount 3 "${MNTPOINT}"/boot/efi
   try_umount 3 "${MNTPOINT}"/boot/firmware
-  if [ -v SOURCE_DATE_EPOCH ] && [ "${HAS_FWBOOT_PART}" = 'yes' ] ; then
+  if reproducible_image_build && [ "${HAS_FWBOOT_PART}" = 'yes' ] ; then
     make_fwboot_part_reproducible
   fi
 
   try_umount 3 "${MNTPOINT}"/run/udev
 
   if [ -n "$PARTITION" ] ; then
-    if [ -v SOURCE_DATE_EPOCH ] ; then
+    if reproducible_image_build ; then
       snapshot_root_filesystem
     fi
     try_umount 3 "$MNTPOINT"
-    if [ -v SOURCE_DATE_EPOCH ] ; then
+    if reproducible_image_build ; then
       reimage_root_filesystem
       normalize_root_superblock
     fi

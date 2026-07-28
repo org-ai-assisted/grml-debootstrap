@@ -16,7 +16,8 @@ DEB_NAME="$1"
 apt-get update
 # docker images can be relatively old, especially for unstable.
 apt-get upgrade -qq -y
-# mtools is a Recommends of grml-debootstrap (reproducible EFI ESP rebuild via
-# make_esp_reproducible); install it explicitly so a reproducible EFI build never
-# aborts on the check4progs guard even if Recommends handling changes.
-apt-get install -qq -y "$DEB_NAME" mtools
+# mtools (ESP rebuild) and python3 (deterministic identifier derivation) are only
+# Recommends of grml-debootstrap, but check4progs treats both as hard requirements
+# for a reproducible build; install them explicitly so a build never aborts on that
+# guard if Recommends handling changes.
+apt-get install -qq -y "$DEB_NAME" mtools python3

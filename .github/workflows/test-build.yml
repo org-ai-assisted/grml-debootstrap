@@ -103,7 +103,7 @@ jobs:
             reproducible: 'yes'
           # The amd64 VM is BIOS (no ESP), so the leg above never exercises the
           # ESP-reproducibility path. arm64 VM is UEFI (VMEFI=1 -> a real ESP),
-          # so this leg additionally proves make_esp_reproducible and the GPT
+          # so this leg additionally proves make_fwboot_part_reproducible and the GPT
           # disk-identifier determinism, and that the stripped arm64 image boots.
           - host_release: trixie
             release: trixie
@@ -175,7 +175,7 @@ jobs:
     # new job. A difference uploads a diffoscope-style report.
     #
     # Run it on BOTH architectures: amd64 proves the BIOS/msdos + ext4 path, arm64
-    # proves the UEFI GPT+ESP path (make_esp_reproducible). The grml-debootstrap
+    # proves the UEFI GPT+ESP path (make_fwboot_part_reproducible). The grml-debootstrap
     # .deb is Architecture:all, so both reuse the same deb-trixie artifact.
     needs: build-debian
     strategy:
@@ -211,12 +211,12 @@ jobs:
         if-no-files-found: warn
         retention-days: 14
 
-  snapshot-sources:
-    # Reproducible builds install from snapshot.debian.org and swap the sources
-    # back to the configured mirror at the end of the chroot run. Exercise those
-    # stages directly: a full image build would not show what ends up in
-    # /etc/apt/sources.list.d, and this runs in seconds.
-    name: "Reproducible build apt sources (snapshot swap)"
+  reproducible-checks:
+    # Fast, unprivileged checks of the reproducible-build machinery that a full
+    # image build does not show: what ends up in /etc/apt/sources.list.d, and
+    # which SOURCE_DATE_EPOCH values are accepted. Both run in seconds and need
+    # no .deb, so they gate early rather than behind build-debian.
+    name: "Reproducible build checks (apt sources, SOURCE_DATE_EPOCH)"
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -225,6 +225,9 @@ jobs:
 
     - run: ./tests/snapshot-sources-test.sh
       name: "Snapshot sources are used at build time and replaced afterwards"
+
+    - run: ./tests/source-date-epoch-validation-test.sh
+      name: "SOURCE_DATE_EPOCH is range-checked up front"
 
   firmware-boot:
     # Prove the built image boots under all three amd64 firmware modes: BIOS

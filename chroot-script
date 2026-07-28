@@ -797,10 +797,16 @@ is_grub_bios_compatible() {
   else
     # Scanning the output of lsblk is unreliable in some environments. partx
     # seems to work better.
+    # Matched case-insensitively and tolerating column padding: a missed match
+    # silently selects grub-efi over grub-cloud, i.e. a BIOS-unbootable image
+    # rather than an error.
     local partx_types
-    partx_types="$(partx --show --noheadings --output TYPE "$GRUB")"
-    if [[ "${partx_types}" \
-      =~ (^|$'\n')21686148-6449-6e6f-744e-656564454649($'\n'|$) ]]; then
+    # A partx failure ($GRUB not a whole disk, unreadable label, partx missing)
+    # means "cannot tell", not "abort the build": without the guard the failing
+    # assignment trips the ERR trap and kills the whole chroot run.
+    partx_types="$(partx --show --noheadings --output TYPE "$GRUB" 2>&1)" || true
+    if [[ "${partx_types,,}" \
+      =~ (^|$'\n')[[:space:]]*21686148-6449-6e6f-744e-656564454649[[:space:]]*($'\n'|$) ]]; then
       return 0
     fi
   fi
