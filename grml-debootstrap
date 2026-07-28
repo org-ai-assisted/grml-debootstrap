@@ -73,6 +73,7 @@ RANDOM_HEX_BYTE_IDX=0
 [ -n "$INSTALL_NOTES" ] || INSTALL_NOTES='/etc/debootstrap/install_notes'
 [ -n "$LOCALES" ] || LOCALES='yes'
 [ -n "$MIRROR" ] || MIRROR="$FALLBACK_MIRROR"
+[ -n "$SNAPSHOT_ARCHIVE" ] || SNAPSHOT_ARCHIVE='https://snapshot.debian.org/archive'
 [ -n "$MKFS" ] || MKFS='mkfs.ext4'
 [ -n "$MKFS_OPTS" ] || MKFS_OPTS=''
 [ -n "$PACKAGES" ] || PACKAGES='yes'
@@ -1488,6 +1489,29 @@ if [ -n "${GRUB}" ] && ! [ -b "${GRUB}" ] ;  then
   bailout 1
 fi
 # }}}
+
+# pin the package set to snapshot.debian.org for reproducible builds {{{
+# A mirror serves whatever is current, so pinning only the disk identifiers still
+# lets the same SOURCE_DATE_EPOCH select different package versions as the archive
+# moves on. snapshot.debian.org answers a request for an arbitrary timestamp with
+# the archive as it stood at that instant -- that is, the most recent snapshot at
+# or before it -- so the timestamp derived from SOURCE_DATE_EPOCH is itself the
+# selector and no snapshot listing has to be searched.
+#
+# This deliberately overrides both the default mirror and --mirror for the build.
+# The configured mirror is kept in FINAL_MIRROR and written into the target at the
+# end of the build, so the installed system tracks a real mirror, not the snapshot.
+# Done here, after interactive mode and config file sourcing, so it cannot be
+# overwritten afterwards and so the confirmation screen shows what is really used.
+if [ -v SOURCE_DATE_EPOCH ] ; then
+  FINAL_MIRROR="$MIRROR"
+  SNAPSHOT_TIMESTAMP="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}" +%Y%m%dT%H%M%SZ)"
+  MIRROR="${SNAPSHOT_ARCHIVE}/debian/${SNAPSHOT_TIMESTAMP}"
+  SNAPSHOT_SECURITY_MIRROR="${SNAPSHOT_ARCHIVE}/debian-security/${SNAPSHOT_TIMESTAMP}"
+  einfo "Reproducible build: installing from snapshot.debian.org as of ${SNAPSHOT_TIMESTAMP}, the installed system will use ${FINAL_MIRROR}" ; eend 0
+fi
+# }}}
+
 checkconfiguration
 
 # finally make sure at least $TARGET is set [the partition for the new system] {{{
@@ -2044,10 +2068,18 @@ debootstrap_system() {
   # Support https mirrors.
   bootstrap_include='--include=ca-certificates'
 
+  local -a bootstrap_aptopt=()
+  if [ -v SOURCE_DATE_EPOCH ] ; then
+    # snapshot.debian.org serves the archived Release files of the day, whose
+    # Valid-Until has long passed for anything but a very recent snapshot; apt
+    # rejects them as expired without this.
+    bootstrap_aptopt=(--aptopt='Acquire::Check-Valid-Until "false"')
+  fi
+
   einfo "Running mmdebstrap $DEBOOTSTRAP_OPT for release ${RELEASE}${ARCHINFO} using ${MIRROR}"
-  einfo "Executing: mmdebstrap --skip=cleanup/apt --skip=check/empty $bootstrap_include $ARCHCMD $DEBOOTSTRAP_OPT $RELEASE $MNTPOINT $MIRROR"
+  einfo "Executing: mmdebstrap --skip=cleanup/apt --skip=check/empty ${bootstrap_aptopt[*]} $bootstrap_include $ARCHCMD $DEBOOTSTRAP_OPT $RELEASE $MNTPOINT $MIRROR"
   # shellcheck disable=SC2086
-  mmdebstrap --skip=cleanup/apt --skip=check/empty "$bootstrap_include" $ARCHCMD $DEBOOTSTRAP_OPT "$RELEASE" "$MNTPOINT" "$MIRROR"
+  mmdebstrap --skip=cleanup/apt --skip=check/empty "${bootstrap_aptopt[@]}" "$bootstrap_include" $ARCHCMD $DEBOOTSTRAP_OPT "$RELEASE" "$MNTPOINT" "$MIRROR"
 }
 # }}}
 
@@ -2112,6 +2144,7 @@ preparechroot() {
   [ -n "$EXTRAPACKAGES" ]             && echo "EXTRAPACKAGES='${EXTRAPACKAGES//\'/\'\\\'\'}'"                       >> "$CHROOT_VARIABLES"
   [ -n "$EFI" ]                       && echo "EFI='${EFI//\'/\'\\\'\'}'"                                           >> "$CHROOT_VARIABLES"
   [ -n "$FALLBACK_MIRROR" ]           && echo "FALLBACK_MIRROR='${FALLBACK_MIRROR//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
+  [ -n "$FINAL_MIRROR" ]              && echo "FINAL_MIRROR='${FINAL_MIRROR//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
   [ -n "$FILESYSTEM" ]                && echo "FILESYSTEM='${FILESYSTEM//\'/\'\\\'\'}'"                             >> "$CHROOT_VARIABLES"
   [ -n "$FORCE" ]                     && echo "FORCE='${FORCE//\'/\'\\\'\'}'"                                       >> "$CHROOT_VARIABLES"
   [ -n "$GRMLREPOS" ]                 && echo "GRMLREPOS='${GRMLREPOS//\'/\'\\\'\'}'"                               >> "$CHROOT_VARIABLES"
@@ -2141,6 +2174,7 @@ preparechroot() {
   [ -n "$SCRIPTS" ]                   && echo "SCRIPTS='${SCRIPTS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$SECURE" ]                    && echo "SECURE='${SECURE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$SELECTED_PARTITIONS" ]       && echo "SELECTED_PARTITIONS='${SELECTED_PARTITIONS//\'/\'\\\'\'}'"           >> "$CHROOT_VARIABLES"
+  [ -n "$SNAPSHOT_SECURITY_MIRROR" ]  && echo "SNAPSHOT_SECURITY_MIRROR='${SNAPSHOT_SECURITY_MIRROR//\'/\'\\\'\'}'" >> "$CHROOT_VARIABLES"
   [ -v SOURCE_DATE_EPOCH ]            && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$TARGET" ]                    && echo "TARGET='${TARGET//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$UPGRADE_SYSTEM" ]            && echo "UPGRADE_SYSTEM='${UPGRADE_SYSTEM//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"

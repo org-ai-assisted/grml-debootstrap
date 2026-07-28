@@ -330,6 +330,14 @@ error rather than a silently non-reproducible build. Reproducible EFI images
 additionally require the *mtools* package, and reproducible builds require
 *e2fsprogs* >= 1.47.1 (mke2fs SOURCE_DATE_EPOCH support).
 
+The package set is pinned as well. A reproducible build ignores both the default
+mirror and *--mirror* and installs from the snapshot.debian.org archive as it stood
+at SOURCE_DATE_EPOCH, so the same SOURCE_DATE_EPOCH keeps selecting the same package
+versions as the Debian archive moves on. The configured mirror is written into the
+installed system at the end of the build, so the resulting image tracks a real
+mirror and not the snapshot. Set *SNAPSHOT_ARCHIVE* to use a local snapshot mirror
+instead of snapshot.debian.org.
+
 WARNING: enabling reproducible builds introduces a security risk when a root
 password is specified and relied upon for security. The root password is hashed
 with the fixed salt *ROOTPASSWORD_SALT*; when ROOTPASSWORD_SALT is unset the salt is

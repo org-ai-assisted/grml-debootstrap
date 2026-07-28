@@ -98,7 +98,7 @@ markauto() {
 
 # write a deb822 sources stanza to a file {{{
 writesource() {
-  local file types uris suites components signed_by
+  local file types uris suites components signed_by check_valid_until
 
   file="${1:-}"
   types="${2:-}"
@@ -106,6 +106,10 @@ writesource() {
   suites="${4:-}"
   components="${5:-}"
   signed_by="${6:-}"
+  # 'no' for snapshot.debian.org sources, whose archived Release files are long
+  # past their Valid-Until. Set per source rather than globally so it applies to
+  # exactly the snapshot stanzas and disappears with them.
+  check_valid_until="${7:-}"
 
   mkdir -p "$(dirname "${file}")"
 
@@ -120,6 +124,9 @@ writesource() {
   echo "Components: $components" >> "$file"
   if [ -n "$signed_by" ]; then
     echo "Signed-By: $signed_by" >> "$file"
+  fi
+  if [ -n "$check_valid_until" ]; then
+    echo "Check-Valid-Until: $check_valid_until" >> "$file"
   fi
 }
 # }}}
@@ -137,16 +144,27 @@ chrootmirror() {
   fi
   echo "Using repository components $COMPONENTS"
 
+  # During a reproducible build MIRROR points at a snapshot.debian.org archive,
+  # whose Release files are past their Valid-Until, and the matching security
+  # archive is the snapshot one rather than the live security.debian.org.
+  local build_check_valid_until security_mirror
+  build_check_valid_until=''
+  security_mirror='http://security.debian.org/debian-security'
+  if [ -v SOURCE_DATE_EPOCH ] ; then
+    build_check_valid_until='no'
+    [ -n "$SNAPSHOT_SECURITY_MIRROR" ] && security_mirror="$SNAPSHOT_SECURITY_MIRROR"
+  fi
+
   if [ -n "$MIRROR" ] ; then
     echo "Deleting obsolete sources.list"
     rm -f /etc/apt/sources.list
 
     if grep -q 'file:' <<< "$MIRROR" ; then
       echo "Adjusting sources.list.d/local.sources for mirror (${MIRROR})."
-      writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+      writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "$build_check_valid_until"
     else
       echo "Adjusting sources.list.d/debian.sources for mirror (${MIRROR})."
-      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "$build_check_valid_until"
     fi
   fi
 
@@ -155,8 +173,8 @@ chrootmirror() {
     unstable|sid) ;;  # no security pool available
     *)
       # https://lists.debian.org/debian-devel-announce/2019/07/msg00004.html
-      echo "Adding security.debian.org/debian-security to sources.list.d/debian.sources."
-      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' 'http://security.debian.org/debian-security' "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+      echo "Adding ${security_mirror} to sources.list.d/debian.sources."
+      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$security_mirror" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "$build_check_valid_until"
       ;;
   esac
 }
@@ -176,6 +194,47 @@ remove_chrootmirror() {
     echo "Adding fallback mirror entry (${FALLBACK_MIRROR}) to sources.list.d/debian.sources instead."
     writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FALLBACK_MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
   fi
+}
+# }}}
+
+# replace the snapshot.debian.org build sources with the configured mirror {{{
+# shellcheck disable=SC2329
+restore_snapshot_mirror() {
+  # Only reproducible builds install from a snapshot; FINAL_MIRROR carries the
+  # mirror the user actually asked for (default or --mirror).
+  [ -v SOURCE_DATE_EPOCH ] || return 0
+  [ -n "$FINAL_MIRROR" ] || return 0
+
+  if [ "$KEEP_SRC_LIST" = "yes" ] ; then
+    echo "KEEP_SRC_LIST has been enabled, leaving sources.list.d untouched."
+  else
+    echo "Replacing snapshot build sources with the configured mirror (${FINAL_MIRROR})."
+    # writesource appends, so the snapshot-derived files have to go first,
+    # otherwise the image ends up carrying both sets of stanzas.
+    rm -f /etc/apt/sources.list.d/debian.sources
+    writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FINAL_MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+    case "$RELEASE" in
+      unstable|sid) ;;  # no security pool available
+      *)
+        writesource '/etc/apt/sources.list.d/debian.sources' 'deb' 'http://security.debian.org/debian-security' "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+        ;;
+    esac
+
+    if [ -f /etc/apt/sources.list.d/backports.sources ] ; then
+      rm -f /etc/apt/sources.list.d/backports.sources
+      echo "# debian backports: ${RELEASE}-backports repository:" >> /etc/apt/sources.list.d/backports.sources
+      writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$FINAL_MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg'
+    fi
+  fi
+
+  # The package indices were fetched from the snapshot: they carry its expired
+  # Valid-Until and no longer describe the mirror just written, so the first
+  # apt update on the booted system would fail on them. apt-get clean does not
+  # touch these (it only clears /var/cache/apt/archives), and mmdebstrap was
+  # deliberately run with --skip=cleanup/apt, so they are still present here.
+  # Removing them is also what keeps snapshot-derived state out of the image.
+  rm -rf /var/lib/apt/lists
+  mkdir -p /var/lib/apt/lists/partial
 }
 # }}}
 
@@ -226,8 +285,11 @@ EOF
 # shellcheck disable=SC2329
 backportrepos() {
   if [ -n "$BACKPORTREPOS" ] ; then
+    local backports_check_valid_until=''
+    # see chrootmirror(): MIRROR is a snapshot archive during reproducible builds
+    [ -v SOURCE_DATE_EPOCH ] && backports_check_valid_until='no'
     echo "# debian backports: ${RELEASE}-backports repository:" >> /etc/apt/sources.list.d/backports.sources
-    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg'
+    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg' "$backports_check_valid_until"
   fi
 }
 # }}}
@@ -993,7 +1055,7 @@ trap signal_handler HUP INT QUIT TERM
      default_locales timezone fstab install_fs_tools hostname \
      initrd grub_install passwords \
      custom_scripts upgrade_system rpi_cmdline remove_apt_cache services \
-     remove_chrootmirror reproducible_finalize; do
+     remove_chrootmirror restore_snapshot_mirror reproducible_finalize; do
      if stage "$i" ; then
        "$i"
        stage "$i" 'done'

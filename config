@@ -46,6 +46,15 @@
 # use 'http://deb.debian.org/debian'
 # Usage example:
 # MIRROR='ftp://ftp.de.debian.org/debian'
+# Note: a reproducible build (SOURCE_DATE_EPOCH set) installs from
+# SNAPSHOT_ARCHIVE instead and only writes MIRROR into the installed system.
+
+# Archive to install from during reproducible builds. The snapshot matching
+# SOURCE_DATE_EPOCH is used, so the same SOURCE_DATE_EPOCH keeps selecting the
+# same package versions; MIRROR is restored in the target afterwards. Point this
+# at a local snapshot mirror to avoid depending on snapshot.debian.org.
+# Default: 'https://snapshot.debian.org/archive'
+# SNAPSHOT_ARCHIVE='https://snapshot.debian.org/archive'
 
 # If /etc/apt/sources.list.d/debian.sources should NOT be built on the fly,
 # this option allows providing a separate apt sources.list file via
