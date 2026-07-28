@@ -197,6 +197,44 @@ remove_chrootmirror() {
 }
 # }}}
 
+# point one sources file back at the runtime mirror {{{
+# Rewrites only what this build put there: stages that ran earlier,
+# custom_scripts in particular, may have added their own stanzas, and a normal
+# build keeps those. Whole-line matching rather than sed, so a mirror URL
+# containing '&', '|' or a regex metacharacter cannot corrupt the result or
+# abort the run.
+rewrite_snapshot_sources() {
+  local runtime_mirror sources_file line snapshot_stanza
+  runtime_mirror="$1"
+  sources_file="$2"
+  ## Whether the stanza being read is one this build wrote. writesource always
+  ## emits URIs before Check-Valid-Until, so this is known by the time the
+  ## latter is reached, and a stanza someone else added keeps its own fields.
+  snapshot_stanza='no'
+
+  while IFS= read -r line ; do
+    case "$line" in
+      '')
+        snapshot_stanza='no' ;;
+      "URIs: ${MIRROR}")
+        line="URIs: ${runtime_mirror}"
+        snapshot_stanza='yes' ;;
+      "URIs: ${SNAPSHOT_SECURITY_MIRROR}")
+        line='URIs: http://security.debian.org/debian-security'
+        snapshot_stanza='yes' ;;
+      "deb ${MIRROR} "*)
+        line="deb ${runtime_mirror} ${line#"deb ${MIRROR} "}" ;;
+      'Check-Valid-Until: no')
+        [ "$snapshot_stanza" = 'no' ] || continue ;;
+    esac
+    printf '%s\n' "$line"
+  done < "$sources_file" > "${sources_file}.tmp"
+
+  cat "${sources_file}.tmp" > "$sources_file"
+  rm -f "${sources_file}.tmp"
+}
+# }}}
+
 # replace the snapshot.debian.org build sources with the configured mirror {{{
 # shellcheck disable=SC2329
 restore_snapshot_mirror() {
@@ -217,19 +255,11 @@ restore_snapshot_mirror() {
   fi
 
   echo "Replacing snapshot build sources with the configured mirror (${runtime_mirror})."
-  # Rewrite only the URIs this build put there, rather than regenerating the
-  # files: stages that ran earlier, custom_scripts in particular, may have
-  # added their own stanzas, and a normal build keeps those.
   for sources_file in /etc/apt/sources.list \
     /etc/apt/sources.list.d/debian.sources \
     /etc/apt/sources.list.d/backports.sources ; do
     [ -f "$sources_file" ] || continue
-    sed -i \
-      -e "s|^URIs: ${MIRROR}\$|URIs: ${runtime_mirror}|" \
-      -e "s|^URIs: ${SNAPSHOT_SECURITY_MIRROR}\$|URIs: http://security.debian.org/debian-security|" \
-      -e "s|^deb \(\[[^]]*\] \)\?${MIRROR} |deb \1${runtime_mirror} |" \
-      -e '/^Check-Valid-Until: no$/d' \
-      "$sources_file"
+    rewrite_snapshot_sources "$runtime_mirror" "$sources_file"
   done
 
   # The package indices were fetched from the snapshot: they carry its expired
@@ -238,8 +268,11 @@ restore_snapshot_mirror() {
   # touch these (it only clears /var/cache/apt/archives), and mmdebstrap was
   # deliberately run with --skip=cleanup/apt, so they are still present here.
   # Removing them is also what keeps snapshot-derived state out of the image.
-  rm -rf /var/lib/apt/lists
-  mkdir -p /var/lib/apt/lists/partial
+  # Only the contents go: recreating the directories would lose apt's _apt
+  # ownership and 0700 mode on partial/, leaving apt unable to drop privileges
+  # for downloads on the installed system.
+  find /var/lib/apt/lists -mindepth 1 -maxdepth 1 ! -name partial -exec rm -rf {} +
+  find /var/lib/apt/lists/partial -mindepth 1 -delete 2>/dev/null || true
 }
 # }}}
 
@@ -1005,9 +1038,20 @@ reproducible_finalize() {
   # system (a different disk, reset on first configure), so only its determinism
   # matters. Re-set every grub *_install_devices answer debconf currently holds; the
   # owning package is the part of the key before the '/'.
-  local install_devices_key
+  #
+  # Only answers naming a loop or device-mapper node are touched. A bare-metal
+  # install records the real disk there, which is neither build-varying nor
+  # meaningless: overwriting it would point the next grub package upgrade at a
+  # device that does not exist, leaving the bootloader unrefreshed.
+  local install_devices_key install_devices_value
   while read -r install_devices_key; do
     [ -n "$install_devices_key" ] || continue
+    install_devices_value="$(debconf-show "${install_devices_key%%/*}" 2>/dev/null \
+      | sed -n "s|^[* ] ${install_devices_key}: ||p")"
+    case "$install_devices_value" in
+      *'/dev/loop'*|*'/dm-'*|*'dm-name-loop'*) ;;
+      *) continue ;;
+    esac
     printf '%s %s multiselect /dev/loop0\n' \
       "${install_devices_key%%/*}" "$install_devices_key" | debconf-set-selections
   done < <(sed -n 's/^Name: \(grub[^ ]*\/install_devices\)$/\1/p' \

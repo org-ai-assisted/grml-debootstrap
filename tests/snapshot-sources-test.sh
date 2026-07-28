@@ -35,6 +35,7 @@ extract_function() {
 }
 
 eval "$(extract_function writesource)"
+eval "$(extract_function rewrite_snapshot_sources)"
 eval "$(extract_function chrootmirror)"
 eval "$(extract_function restore_snapshot_mirror)"
 
@@ -149,6 +150,21 @@ restore_snapshot_mirror >/dev/null
 
 check 'file: mirror replaced by the fallback'      1 "$(count_matches "^URIs: ${FALLBACK_MIRROR}\$")"
 check 'no file: URI in the installed system'       0 "$(count_matches '^URIs: file:')"
+
+echo '== a mirror URL containing regex/sed metacharacters is written verbatim =='
+reset_sources
+SOURCE_DATE_EPOCH=1767225600
+MIRROR="$SNAPSHOT"
+# '&' would expand to the whole match in a sed replacement, and '|' would end
+# the s||| expression outright.
+FINAL_MIRROR='http://cache.example.com/?u=deb.debian.org&c=1|x'
+SNAPSHOT_SECURITY_MIRROR="$SNAPSHOT_SECURITY"
+KEEP_SRC_LIST='no'
+chrootmirror >/dev/null
+restore_snapshot_mirror >/dev/null
+
+check 'metacharacter mirror written verbatim'      1 "$(count_matches "^URIs: ${FINAL_MIRROR}\$")"
+check 'no snapshot URI left behind'                0 "$(count_matches '^URIs: https://snapshot.debian.org')"
 
 echo '== KEEP_SRC_LIST: sources left alone, snapshot indices still dropped =='
 reset_sources
