@@ -58,7 +58,7 @@ if [ "$1" == "setup" ]; then
   # 'goss-linux-<arch>' binaries), so it 404s and tar aborts. Pin the version,
   # pick the runner's architecture, and verify the published sha256.
   if [ ! -x ./tests/goss ]; then
-    goss_ver='v0.4.9'
+    goss_ver="v${GOSS_VER}"
     goss_arch="$(dpkg --print-architecture)"
     # Pinned, reviewed sha256 per architecture. Do NOT fetch the checksum from the
     # same release -- a tampered release could replace both the binary and its
@@ -103,9 +103,27 @@ if [ "$1" == "run" ]; then
   # apt-cacher-ng URL) to speed up repeated local builds. It is passed through as MIRROR
   # and the container joins the host network so it can reach a cache on the host. Unset
   # (CI, normal runs) -> default bridge network + the built-in mirror, behaviour unchanged.
+  # A reproducible build deliberately ignores MIRROR and installs from
+  # SNAPSHOT_ARCHIVE instead, so APT_CACHE_MIRROR alone does nothing for the
+  # reproducible legs. Two further opt-in knobs keep a local cache usable there:
+  #   APT_CACHE_SNAPSHOT_ARCHIVE  a caching mirror or caching reverse proxy for
+  #                               the snapshot archive, used as SNAPSHOT_ARCHIVE
+  #   APT_PROXY                   a caching HTTP proxy (apt-cacher-ng, squid).
+  #                               Needs an http:// SNAPSHOT_ARCHIVE to be able to
+  #                               cache: https is tunnelled, not cached.
+  # All are unset in CI, leaving those runs on the public archives as before.
   docker_extra=()
-  if [ -n "${APT_CACHE_MIRROR:-}" ]; then
+  if [ -n "${APT_CACHE_MIRROR:-}" ] || [ -n "${APT_CACHE_SNAPSHOT_ARCHIVE:-}" ] \
+    || [ -n "${APT_PROXY:-}" ]; then
     docker_extra+=(--network host)
+  fi
+  if [ -n "${APT_CACHE_SNAPSHOT_ARCHIVE:-}" ]; then
+    docker_extra+=(-e SNAPSHOT_ARCHIVE="$APT_CACHE_SNAPSHOT_ARCHIVE")
+  fi
+  if [ -n "${APT_PROXY:-}" ]; then
+    # grml-debootstrap forwards these into the chroot for the in-chroot apt runs,
+    # and mmdebstrap picks them up from this environment on the host side.
+    docker_extra+=(-e http_proxy="$APT_PROXY" -e https_proxy="$APT_PROXY")
   fi
   exec docker run --privileged --rm -i \
     "${docker_extra[@]}" \

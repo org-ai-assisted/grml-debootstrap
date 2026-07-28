@@ -20,6 +20,9 @@ set -x
 
 # Honour a MIRROR passed in (e.g. a local apt cache via APT_CACHE_MIRROR); default to
 # the public mirror when empty/unset, so CI and normal runs are unchanged.
+# A reproducible build (SOURCE_DATE_EPOCH set) ignores this and installs from
+# SNAPSHOT_ARCHIVE, which grml-debootstrap reads straight from the environment;
+# MIRROR is then only what the built system ends up pointing at.
 MIRROR="${MIRROR:-https://deb.debian.org/debian}"
 
 
