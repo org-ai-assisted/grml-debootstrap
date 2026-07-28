@@ -959,7 +959,7 @@ if [ -v SOURCE_DATE_EPOCH ] ; then
     eerror "SOURCE_DATE_EPOCH is set but empty. Please unset it or set it to a decimal integer."
     bailout 1
   fi
-  if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[1-9][0-9]+$ ]] ; then
+  if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[1-9][0-9]*$ ]] ; then
     eerror "SOURCE_DATE_EPOCH is set to '${SOURCE_DATE_EPOCH}' but is not a decimal integer. Please unset it or set it to a decimal integer."
     bailout 1
   fi
@@ -1900,7 +1900,9 @@ make_fwboot_part_reproducible() {
   fi
 
   # Copy all files from the firmware boot partition to the reimage tree.
-  mcopy -i "${fwboot_part}" -s '::/.' "${FWBOOT_REIMAGE_TREE}/"
+  # MTOOLS_SKIP_CHECK: grub populates the ESP with a geometry mtools' consistency
+  # check rejects, which would abort the build under errexit.
+  MTOOLS_SKIP_CHECK=1 mcopy -i "${fwboot_part}" -s '::/.' "${FWBOOT_REIMAGE_TREE}/"
   if [ -z "$(ls -A "${FWBOOT_REIMAGE_TREE}")" ]; then
     eerror "No firmware boot files extracted from '${fwboot_part}'!"
     bailout 1
@@ -1929,7 +1931,7 @@ make_fwboot_part_reproducible() {
       # This shouldn't ever happen...
       continue
     fi
-    mcopy -i "${fwboot_part}" -s -m "${fwboot_object}" '::/'
+    MTOOLS_SKIP_CHECK=1 mcopy -i "${fwboot_part}" -s -m "${fwboot_object}" '::/'
   done
 
   rm -rf "${FWBOOT_REIMAGE_TREE}"
@@ -1955,6 +1957,15 @@ snapshot_root_filesystem() {
   ROOTFS_REIMAGE_TREE="$(mktemp -d -p "${reimage_parent}")"
 
   cp -a --one-file-system "${MNTPOINT}/." "${ROOTFS_REIMAGE_TREE}/"
+
+  # An empty snapshot means MNTPOINT was not the live mount; re-imaging from it
+  # would mkfs over a working installation and silently produce an unbootable
+  # image (the reproducibility comparison still passes, since both images are
+  # equally empty). Mirrors the firmware boot partition guard above.
+  if [ -z "$(ls -A "${ROOTFS_REIMAGE_TREE}")" ]; then
+    eerror "Root filesystem snapshot from '${MNTPOINT}' is empty, refusing to re-image '${TARGET}'!"
+    bailout 1
+  fi
 }
 # }}}
 
@@ -1975,10 +1986,43 @@ reimage_root_filesystem() {
 
   # If TARGET is still mounted somewhere, mkfs.ext4 will refuse to overwrite
   # it since -F is only passed once.
+  # shellcheck disable=SC2086
   "${MKFS}" ${MKFS_OPTS} -d "${ROOTFS_REIMAGE_TREE}" -F "${TARGET}"
   rm -rf "${ROOTFS_REIMAGE_TREE}"
   ROOTFS_REIMAGE_TREE=''
   tunefs
+}
+# }}}
+
+# pin the root filesystem superblock timestamps {{{
+normalize_root_superblock() {
+  local sde_hex sde_cmd debugfs_err
+
+  # Required for byte-for-byte reproducibility: mke2fs -d, and the tune2fs run
+  # tunefs does afterwards, leave the superblock's last-mount / write / check
+  # times and the lifetime-writes counter at build-varying values. libext2fs
+  # honours SOURCE_DATE_EPOCH for the time fields, but kbytes_written is a byte
+  # counter, not a timestamp, and is not covered by it. Verified: removing this
+  # step makes the reproducible-build comparison fail while the image still boots.
+  einfo "Normalizing the root filesystem superblock"
+
+  # Hex because debugfs misparses large decimal values.
+  sde_hex="$(printf '0x%x' "${SOURCE_DATE_EPOCH}")"
+  # Field names carry no 's_' prefix; an 's_'-prefixed name is rejected outright.
+  for sde_cmd in "set_super_value mtime ${sde_hex}" \
+                 "set_super_value wtime ${sde_hex}" \
+                 "set_super_value lastcheck ${sde_hex}" \
+                 "set_super_value kbytes_written 0" ; do
+    # debugfs exits 0 even when set_super_value fails internally, so inspect its
+    # stderr and bail out on a real error.
+    debugfs_err="$(debugfs -w -R "${sde_cmd}" "${TARGET}" 2>&1 1>/dev/null)"
+    case "${debugfs_err}" in
+      *"set_super_value:"*)
+        eerror "debugfs rejected '${sde_cmd}' on '${TARGET}': ${debugfs_err}"
+        bailout 1
+        ;;
+    esac
+  done
 }
 # }}}
 
@@ -2064,6 +2108,7 @@ preparechroot() {
   [ -n "$DEBIAN_FRONTEND" ]           && echo "DEBIAN_FRONTEND='${DEBIAN_FRONTEND//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$DEFAULT_LOCALES" ]           && echo "DEFAULT_LOCALES='${DEFAULT_LOCALES//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$DEFAULT_LANGUAGE" ]          && echo "DEFAULT_LANGUAGE='${DEFAULT_LANGUAGE//\'/\'\\\'\'}'"                 >> "$CHROOT_VARIABLES"
+  [ -n "$DPKG_OPTIONS" ]              && echo "DPKG_OPTIONS='${DPKG_OPTIONS//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
   [ -n "$EXTRAPACKAGES" ]             && echo "EXTRAPACKAGES='${EXTRAPACKAGES//\'/\'\\\'\'}'"                       >> "$CHROOT_VARIABLES"
   [ -n "$EFI" ]                       && echo "EFI='${EFI//\'/\'\\\'\'}'"                                           >> "$CHROOT_VARIABLES"
   [ -n "$FALLBACK_MIRROR" ]           && echo "FALLBACK_MIRROR='${FALLBACK_MIRROR//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
@@ -2096,7 +2141,7 @@ preparechroot() {
   [ -n "$SCRIPTS" ]                   && echo "SCRIPTS='${SCRIPTS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$SECURE" ]                    && echo "SECURE='${SECURE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$SELECTED_PARTITIONS" ]       && echo "SELECTED_PARTITIONS='${SELECTED_PARTITIONS//\'/\'\\\'\'}'"           >> "$CHROOT_VARIABLES"
-  [ -n "$SOURCE_DATE_EPOCH" ]         && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
+  [ -v SOURCE_DATE_EPOCH ]            && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$TARGET" ]                    && echo "TARGET='${TARGET//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$UPGRADE_SYSTEM" ]            && echo "UPGRADE_SYSTEM='${UPGRADE_SYSTEM//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$TARGET_UUID" ]               && echo "TARGET_UUID='${TARGET_UUID//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
@@ -2387,6 +2432,7 @@ umount_chroot() {
     try_umount 3 "$MNTPOINT"
     if [ -v SOURCE_DATE_EPOCH ] ; then
       reimage_root_filesystem
+      normalize_root_superblock
     fi
 
     if [ -n "${VIRTUAL}" ] || [ -n "$RPI" ] ; then

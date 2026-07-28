@@ -328,19 +328,19 @@ SOURCE_DATE_EPOCH and inputs produce byte-identical images. Leave SOURCE_DATE_EP
 unset for a normal, non-reproducible build. A set but malformed value is a hard
 error rather than a silently non-reproducible build. Reproducible EFI images
 additionally require the *mtools* package, and reproducible builds require
-*e2fsprogs* >= 1.44.0 (mke2fs SOURCE_DATE_EPOCH support).
+*e2fsprogs* >= 1.47.1 (mke2fs SOURCE_DATE_EPOCH support).
 
 WARNING: enabling reproducible builds introduces a security risk when a root
 password is specified and relied upon for security. The root password is hashed
-with a fixed salt derived from *ROOTPASSWORD_SEED*; when ROOTPASSWORD_SEED is unset
-the salt is derived from SOURCE_DATE_EPOCH instead. That means anyone, anywhere,
-who builds an image with the same SOURCE_DATE_EPOCH uses the same salt to hash
-their root password as every other such user, and building several images that
-share a SOURCE_DATE_EPOCH reuses the salt across them. This is not a problem in
-most scenarios but may be in some. Users who consider it a problem must not use
-reproducible builds, or must set *ROOTPASSWORD_SEED* to a fixed but initially
-randomly generated value. grml-debootstrap logs a warning at build time when
-SOURCE_DATE_EPOCH is set but ROOTPASSWORD_SEED is not.
+with the fixed salt *ROOTPASSWORD_SALT*; when ROOTPASSWORD_SALT is unset the salt is
+derived from SOURCE_DATE_EPOCH instead. That means anyone, anywhere, who builds an
+image with the same SOURCE_DATE_EPOCH uses the same salt to hash their root password
+as every other such user, and building several images that share a SOURCE_DATE_EPOCH
+reuses the salt across them. This is not a problem in most scenarios but may be in
+some. Users who consider it a problem must not use reproducible builds, or must set
+*ROOTPASSWORD_SALT* to a fixed but initially randomly generated value.
+grml-debootstrap logs a warning at build time when SOURCE_DATE_EPOCH is set but
+ROOTPASSWORD_SALT is not.
 
 Networking
 ----------

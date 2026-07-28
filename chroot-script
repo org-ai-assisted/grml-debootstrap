@@ -34,7 +34,7 @@ bash -n /etc/debootstrap/variables
 . /etc/debootstrap/variables || exit 1
 
 # Make sure all tools see SOURCE_DATE_EPOCH if it's available
-[ -n "${SOURCE_DATE_EPOCH:-}" ] && export SOURCE_DATE_EPOCH
+[ -v SOURCE_DATE_EPOCH ] && export SOURCE_DATE_EPOCH
 
 [ -r /proc/1 ] || mount -t proc none /proc
 [ -r /sys/kernel ] || mount -t sysfs none /sys
@@ -921,6 +921,30 @@ reproducible_finalize() {
   # machine-id
   printf 'uninitialized\n' > /etc/machine-id
   rm -f /var/lib/dbus/machine-id # copied from /etc/machine-id on boot
+
+  # The debconf database (/var/cache/debconf/config.dat) is deliberately NOT removed
+  # -- it holds real configured answers and 'seen' flags, not a regenerable cache. It
+  # carries one build-varying value: grub records its install device as the ephemeral
+  # build loop device (/dev/loopN), whose number depends on host loop allocation.
+  # Canonicalize just that answer to a stable placeholder using debconf's own tooling
+  # rather than editing config.dat by hand (a hand-edit can corrupt the database and
+  # misses debconf's on-disk encoding). The value is meaningless on the deployed
+  # system (a different disk, reset on first configure), so only its determinism
+  # matters. Re-set every grub *_install_devices answer debconf currently holds; the
+  # owning package is the part of the key before the '/'.
+  local install_devices_key
+  while read -r install_devices_key; do
+    [ -n "$install_devices_key" ] || continue
+    printf '%s %s multiselect /dev/loop0\n' \
+      "${install_devices_key%%/*}" "$install_devices_key" | debconf-set-selections
+  done < <(sed -n 's/^Name: \(grub[^ ]*\/install_devices\)$/\1/p' \
+    /var/cache/debconf/config.dat 2>/dev/null | sort -u)
+  # config.dat-old is debconf's backup of the pre-write database and still holds the
+  # build-varying loop device. debconf recreates it on the deployed system's next
+  # database write, so deleting it here is safe and removes the build-varying bytes.
+  # Delete it AFTER the debconf-set-selections writes above, which would otherwise
+  # recreate it from the not-yet-canonicalized database.
+  rm -f /var/cache/debconf/config.dat-old
 
   # logs
   rm -f /var/log/alternatives.log /var/log/dpkg.log /var/log/apt/history.log \
