@@ -68,7 +68,9 @@ if [ "$1" == "setup" ]; then
       arm64) goss_sha='14fd24ac08236559f4809e6a627792d1b947ed98654bba1662ef1d6122d77e18' ;;
       *) echo "$0: no pinned goss checksum for architecture '$goss_arch'" >&2 ; exit 1 ;;
     esac
-    curl -fsSL -o ./tests/goss \
+    # --max-time: a stalled connection would otherwise hang the setup step
+    # indefinitely, and nothing else in it carries a network timeout either.
+    curl -fsSL --max-time 300 -o ./tests/goss \
       "https://github.com/goss-org/goss/releases/download/${goss_ver}/goss-linux-${goss_arch}"
     echo "${goss_sha}  ./tests/goss" | sha256sum -c -
     chmod +x ./tests/goss

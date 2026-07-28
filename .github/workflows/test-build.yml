@@ -185,6 +185,9 @@ jobs:
         - ubuntu-latest
         - ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Two full image builds, normally well under this. Bounded for the same
+    # reason as firmware-boot below.
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v7
       with:
@@ -238,6 +241,10 @@ jobs:
     needs: build-debian
     name: "Boot image under BIOS / UEFI / UEFI+SecureBoot (amd64, trixie)"
     runs-on: ubuntu-latest
+    # Normal runtime is ~13 minutes. No network operation in the setup step has
+    # a timeout, so a stalled apt or curl would otherwise sit on the default
+    # 6-hour job limit; seen wedging for an hour in the setup step.
+    timeout-minutes: 45
     steps:
     - uses: actions/checkout@v7
       with:
