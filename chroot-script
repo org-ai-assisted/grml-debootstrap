@@ -205,27 +205,32 @@ restore_snapshot_mirror() {
   [ -v SOURCE_DATE_EPOCH ] || return 0
   [ -n "$FINAL_MIRROR" ] || return 0
 
-  if [ "$KEEP_SRC_LIST" = "yes" ] ; then
-    echo "KEEP_SRC_LIST has been enabled, leaving sources.list.d untouched."
-  else
-    echo "Replacing snapshot build sources with the configured mirror (${FINAL_MIRROR})."
-    # writesource appends, so the snapshot-derived files have to go first,
-    # otherwise the image ends up carrying both sets of stanzas.
-    rm -f /etc/apt/sources.list.d/debian.sources
-    writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FINAL_MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
-    case "$RELEASE" in
-      unstable|sid) ;;  # no security pool available
-      *)
-        writesource '/etc/apt/sources.list.d/debian.sources' 'deb' 'http://security.debian.org/debian-security' "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
-        ;;
-    esac
-
-    if [ -f /etc/apt/sources.list.d/backports.sources ] ; then
-      rm -f /etc/apt/sources.list.d/backports.sources
-      echo "# debian backports: ${RELEASE}-backports repository:" >> /etc/apt/sources.list.d/backports.sources
-      writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$FINAL_MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg'
-    fi
+  local runtime_mirror sources_file
+  runtime_mirror="$FINAL_MIRROR"
+  # A local build mirror is not reachable from the installed system. This is
+  # what remove_chrootmirror does for a non-reproducible build; it cannot do it
+  # here because MIRROR holds the snapshot URL by this point, so its 'file:'
+  # test never matches.
+  if grep -q 'file:' <<< "$runtime_mirror" ; then
+    echo "Configured mirror (${runtime_mirror}) is local, using the fallback mirror (${FALLBACK_MIRROR}) instead."
+    runtime_mirror="$FALLBACK_MIRROR"
   fi
+
+  echo "Replacing snapshot build sources with the configured mirror (${runtime_mirror})."
+  # Rewrite only the URIs this build put there, rather than regenerating the
+  # files: stages that ran earlier, custom_scripts in particular, may have
+  # added their own stanzas, and a normal build keeps those.
+  for sources_file in /etc/apt/sources.list \
+    /etc/apt/sources.list.d/debian.sources \
+    /etc/apt/sources.list.d/backports.sources ; do
+    [ -f "$sources_file" ] || continue
+    sed -i \
+      -e "s|^URIs: ${MIRROR}\$|URIs: ${runtime_mirror}|" \
+      -e "s|^URIs: ${SNAPSHOT_SECURITY_MIRROR}\$|URIs: http://security.debian.org/debian-security|" \
+      -e "s|^deb \(\[[^]]*\] \)\?${MIRROR} |deb \1${runtime_mirror} |" \
+      -e '/^Check-Valid-Until: no$/d' \
+      "$sources_file"
+  done
 
   # The package indices were fetched from the snapshot: they carry its expired
   # Valid-Until and no longer describe the mirror just written, so the first

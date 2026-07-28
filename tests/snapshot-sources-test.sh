@@ -121,6 +121,35 @@ check 'restore is a no-op without SOURCE_DATE_EPOCH' 1 "$(count_matches "^URIs: 
 check 'apt indices untouched in a normal build'    'leftover-index' \
   "$(remaining_indices)"
 
+echo '== stanzas added by earlier stages (custom_scripts) survive the swap =='
+reset_sources
+SOURCE_DATE_EPOCH=1767225600
+MIRROR="$SNAPSHOT"
+FINAL_MIRROR="$REAL_MIRROR"
+SNAPSHOT_SECURITY_MIRROR="$SNAPSHOT_SECURITY"
+KEEP_SRC_LIST='no'
+chrootmirror >/dev/null
+# what a custom script would append
+writesource '/etc/apt/sources.list.d/debian.sources' 'deb' 'http://example.com/custom' \
+  "$RELEASE" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg'
+restore_snapshot_mirror >/dev/null
+
+check 'custom stanza still present'                1 "$(count_matches '^URIs: http://example.com/custom$')"
+check 'snapshot stanza still swapped'              1 "$(count_matches "^URIs: ${REAL_MIRROR}\$")"
+check 'no snapshot URI left behind'                0 "$(count_matches '^URIs: https://snapshot.debian.org')"
+
+echo '== a local (file:) mirror is not written into the installed system =='
+reset_sources
+SOURCE_DATE_EPOCH=1767225600
+MIRROR="$SNAPSHOT"
+FINAL_MIRROR='file:///srv/local-mirror'
+SNAPSHOT_SECURITY_MIRROR="$SNAPSHOT_SECURITY"
+chrootmirror >/dev/null
+restore_snapshot_mirror >/dev/null
+
+check 'file: mirror replaced by the fallback'      1 "$(count_matches "^URIs: ${FALLBACK_MIRROR}\$")"
+check 'no file: URI in the installed system'       0 "$(count_matches '^URIs: file:')"
+
 echo '== KEEP_SRC_LIST: sources left alone, snapshot indices still dropped =='
 reset_sources
 SOURCE_DATE_EPOCH=1767225600

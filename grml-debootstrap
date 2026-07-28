@@ -988,6 +988,15 @@ if [ -v SOURCE_DATE_EPOCH ] ; then
     eerror "SOURCE_DATE_EPOCH is larger than INT64_MAX. Please unset it or set it to a smaller decimal integer."
     bailout 1
   fi
+  # A future timestamp cannot pin anything: snapshot.debian.org answers a
+  # request for it with the newest snapshot that exists when the request is
+  # made, so the same SOURCE_DATE_EPOCH keeps selecting newer packages as the
+  # archive grows. Refuse it rather than produce a silently unreproducible
+  # image, the same way a malformed value is refused.
+  if [ "${SOURCE_DATE_EPOCH}" -gt "$(date -u +%s)" ] ; then
+    eerror "SOURCE_DATE_EPOCH is in the future. Please set it to a past timestamp; a future one cannot select a fixed package set."
+    bailout 1
+  fi
   if [ "${MKFS}" != 'mkfs.ext4' ] ; then
     eerror "SOURCE_DATE_EPOCH is set, but MKFS is not mkfs.ext4. Reproducible builds are only supported when using ext4."
     bailout 1

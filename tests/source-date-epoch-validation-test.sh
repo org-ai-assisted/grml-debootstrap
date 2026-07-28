@@ -27,6 +27,7 @@ verdict_for() {
   output="$(SOURCE_DATE_EPOCH="$1" "$GRML_DEBOOTSTRAP" --vmfile --target /nonexistent/gd.img 2>&1 || true)"
   case "$output" in
     *'larger than INT64_MAX'*)      echo 'range' ;;
+    *'in the future'*)              echo 'future' ;;
     *'is not a decimal integer'*)   echo 'notinteger' ;;
     *'set but empty'*)              echo 'empty' ;;
     *'need root'*|*'root permission'*|*'For usage instructions'*) echo 'accepted' ;;
@@ -56,12 +57,16 @@ check ' 123'                 notinteger
 check '9999999999999999999'  range            # 19 digits, wraps negative
 check '18446744073709551616' range            # 2**64, wraps to 0, not negative
 check '99999999999999999999' range            # 20 digits, wraps to a bogus positive
+# snapshot.debian.org answers a future timestamp with the newest snapshot that
+# exists at request time, so it pins nothing and drifts as the archive grows.
+check "$(( $(date -u +%s) + 86400 ))" future
+# In range, but still a future date, so the same rejection applies.
+check '9223372036854775807'  future           # INT64_MAX
 
 echo '== accepted =='
 check '1'                    accepted         # single digit must not be rejected
 check '9'                    accepted
 check '1767225600'           accepted
-check '9223372036854775807'  accepted         # INT64_MAX itself
 
 echo
 if [ "$failures" -eq 0 ]; then
