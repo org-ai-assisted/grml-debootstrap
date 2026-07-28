@@ -574,6 +574,12 @@ insecure_password_salt_from_sde() {
   # more secure than no salt.
 
   for (( gen_idx = 0; gen_idx < 8; gen_idx++ )); do
+    ## Reset per iteration: appending without clearing makes the value exceed
+    ## 64 bits from the third pass on, where bash truncates it (silently, the
+    ## '|| true' below hides nothing since no error is raised), so the later
+    ## digits would derive from the low bytes of an ever-growing prefix
+    ## instead of from their own 24 fresh bits.
+    hex_str=''
     for (( gen_sub_idx = 0; gen_sub_idx < 3; gen_sub_idx++ )); do
       get_random_hex_byte rand_byte
       hex_str+="${rand_byte}"
@@ -1015,7 +1021,7 @@ if [ -v SOURCE_DATE_EPOCH ] ; then
   if [ "${ROOTPASSWORD_SALT}" = '0' ] ; then
     ewarn "Reproducible builds are enabled but ROOTPASSWORD_SALT is not set! This may be a security risk!"
     insecure_password_salt_from_sde ROOTPASSWORD_SALT
-  elif ! [[ "${ROOTPASSWORD_SALT}" =~ [./A-Za-z0-9]{,86} ]]; then
+  elif ! [[ "${ROOTPASSWORD_SALT}" =~ ^[./A-Za-z0-9]{1,86}$ ]]; then
     eerror "The value of ROOTPASSWORD_SALT is invalid!"
     bailout 1
   fi
