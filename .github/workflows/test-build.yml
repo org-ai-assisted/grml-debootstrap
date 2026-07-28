@@ -211,6 +211,21 @@ jobs:
         if-no-files-found: warn
         retention-days: 14
 
+  snapshot-sources:
+    # Reproducible builds install from snapshot.debian.org and swap the sources
+    # back to the configured mirror at the end of the chroot run. Exercise those
+    # stages directly: a full image build would not show what ends up in
+    # /etc/apt/sources.list.d, and this runs in seconds.
+    name: "Reproducible build apt sources (snapshot swap)"
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - run: ./tests/snapshot-sources-test.sh
+      name: "Snapshot sources are used at build time and replaced afterwards"
+
   firmware-boot:
     # Prove the built image boots under all three amd64 firmware modes: BIOS
     # (SeaBIOS), UEFI (OVMF) and UEFI+Secure Boot (OVMF, Microsoft keys enrolled).
