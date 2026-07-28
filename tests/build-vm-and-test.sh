@@ -43,11 +43,15 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
 fi
 
 if [ "$1" == "setup" ]; then
-  # DPkg::Lock::Timeout: a CI runner's own unattended-upgrades/apt-daily timer
-  # can hold /var/lib/dpkg/lock-frontend, and apt waits for it forever by
-  # default. That wedged this step twice, for over an hour once, against a
-  # normal runtime of well under a minute. Bounded, it fails loudly instead.
-  apt_get=(sudo apt-get -o DPkg::Lock::Timeout=180)
+  # DEBIAN_FRONTEND: without it a package postinst can open a debconf prompt and
+  # block on stdin forever. That wedged this step repeatedly -- 26 minutes on the
+  # qemu install alone, silently, since -qq prints nothing while blocked -- and it
+  # only shows up when the runner image does not already have the packages, so it
+  # looked intermittent. chroot-script already passes DEBIAN_FRONTEND to every apt
+  # call it makes; this is the same protection, on the host side.
+  # DPkg::Lock::Timeout: the runner's own unattended-upgrades/apt-daily timer can
+  # hold /var/lib/dpkg/lock-frontend, which apt would otherwise wait on forever.
+  apt_get=(sudo env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=180)
   "${apt_get[@]}" update
   "${apt_get[@]}" -qq -y install curl kpartx python3-serial
   DPKG_ARCHITECTURE=$(dpkg --print-architecture)
