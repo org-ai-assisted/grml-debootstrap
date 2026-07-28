@@ -71,11 +71,61 @@ cd "$TEST_TMPDIR"
 MOUNT_TAG=host0
 declare -a qemu_command
 
+# FIRMWARE selects the amd64 boot firmware: bios (SeaBIOS, the default and what the
+# BIOS-only --vmfile images need), efi (OVMF), or efi-secureboot (OVMF Secure Boot,
+# Microsoft keys pre-enrolled). efi / efi-secureboot require an EFI-bootable image
+# (build with VMEFI=1). arm64 is UEFI-only (AAVMF) and ignores FIRMWARE.
+FIRMWARE="${FIRMWARE:-bios}"
+
+# Resolve an OVMF firmware file by trying known names across Debian/Ubuntu layouts
+# (Debian trixie ships the *_4M.* names; older/other layouts drop the _4M infix).
+# Prints the first existing candidate, or exits 1 with a clear message.
+find_ovmf() {
+  local candidate
+  for candidate in "$@"; do
+    if [ -r "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo "E: none of the OVMF firmware candidates exist/readable: $*" >&2
+  echo "E: install the 'ovmf' package (reproducible/EFI boot test)" >&2
+  return 1
+}
+
 DPKG_ARCHITECTURE=$(dpkg --print-architecture)
 if [ "${DPKG_ARCHITECTURE}" = "amd64" ]; then
   qemu_command=( qemu-system-x86_64 )
-  qemu_command+=( -machine q35 )
   qemu_command+=( -cpu max )
+  case "$FIRMWARE" in
+    bios)
+      qemu_command+=( -machine q35 )
+      ;;
+    efi)
+      ovmf_code="$(find_ovmf /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd)"
+      ovmf_vars="$(find_ovmf /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd)"
+      cp "$ovmf_vars" efi_vars.fd
+      qemu_command+=( -machine q35 )
+      qemu_command+=( -drive "if=pflash,format=raw,unit=0,readonly=on,file=${ovmf_code}" )
+      qemu_command+=( -drive "if=pflash,format=raw,unit=1,file=efi_vars.fd" )
+      ;;
+    efi-secureboot)
+      # Secure Boot needs SMM plus the flash 'secure' property, and the MS-key vars
+      # template (pre-enrolled PK/KEK/db) so Debian's MS-signed shim validates. No
+      # manual key enrollment: choosing OVMF_VARS_*.ms.fd IS the enrollment.
+      ovmf_code="$(find_ovmf /usr/share/OVMF/OVMF_CODE_4M.secboot.fd /usr/share/OVMF/OVMF_CODE.secboot.fd)"
+      ovmf_vars="$(find_ovmf /usr/share/OVMF/OVMF_VARS_4M.ms.fd /usr/share/OVMF/OVMF_VARS.ms.fd)"
+      cp "$ovmf_vars" efi_vars.fd
+      qemu_command+=( -machine "q35,smm=on" )
+      qemu_command+=( -global "driver=cfi.pflash01,property=secure,value=on" )
+      qemu_command+=( -drive "if=pflash,format=raw,unit=0,readonly=on,file=${ovmf_code}" )
+      qemu_command+=( -drive "if=pflash,format=raw,unit=1,file=efi_vars.fd" )
+      ;;
+    *)
+      echo "E: unknown FIRMWARE '$FIRMWARE' (expected bios, efi or efi-secureboot)" >&2
+      exit 1
+      ;;
+  esac
 elif [ "${DPKG_ARCHITECTURE}" = "arm64" ]; then
   # Pick a real CPU model, and also one that does not crash QEMU on ubuntu-24.04-arm.
   qemu_command=( qemu-system-aarch64 )
@@ -100,7 +150,7 @@ else
   exit 1
 fi
 qemu_command+=( -smp 2 )
-qemu_command+=( -m 2048 )
+qemu_command+=( -m "${QEMU_MEM:-2048}" )
 qemu_command+=( -drive "file=${VM_IMAGE},format=raw,index=0,media=disk" )
 qemu_command+=( -virtfs "local,path=${TEST_TMPDIR},mount_tag=${MOUNT_TAG},security_model=none,id=host0" )
 qemu_command+=( -nographic )
@@ -112,8 +162,12 @@ qemu_command+=( -serial pty )
 QEMU_PID="$!"
 
 RC=0
+# SERIAL_TIMEOUT caps the wall-clock wait for the login prompt. The default matches
+# the historical behaviour; the firmware boot test raises it because UEFI Secure Boot
+# under TCG (SMM + signature verification, no KVM) reaches login well past 180s.
 "$TEST_PWD"/tests/serial-console-connection \
   --tries 180 \
+  --timeout "${SERIAL_TIMEOUT:-180}" \
   --screenshot "$TEST_PWD/tests/screenshot.jpg" \
   --qemu-log qemu.log \
   --hostname "$VM_HOSTNAME" \
