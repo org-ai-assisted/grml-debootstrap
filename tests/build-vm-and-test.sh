@@ -43,16 +43,21 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
 fi
 
 if [ "$1" == "setup" ]; then
-  sudo apt-get update
-  sudo apt-get -qq -y install curl kpartx python3-serial
+  # DPkg::Lock::Timeout: a CI runner's own unattended-upgrades/apt-daily timer
+  # can hold /var/lib/dpkg/lock-frontend, and apt waits for it forever by
+  # default. That wedged this step twice, for over an hour once, against a
+  # normal runtime of well under a minute. Bounded, it fails loudly instead.
+  apt_get=(sudo apt-get -o DPkg::Lock::Timeout=180)
+  "${apt_get[@]}" update
+  "${apt_get[@]}" -qq -y install curl kpartx python3-serial
   DPKG_ARCHITECTURE=$(dpkg --print-architecture)
   if [ "${DPKG_ARCHITECTURE}" = "amd64" ]; then
-    sudo apt-get -qq -y install qemu-system qemu-system-gui ovmf seabios
+    "${apt_get[@]}" -qq -y install qemu-system qemu-system-gui ovmf seabios
   elif [ "${DPKG_ARCHITECTURE}" = "arm64" ]; then
-    sudo apt-get -qq -y install qemu-system qemu-system-gui qemu-efi-aarch64
+    "${apt_get[@]}" -qq -y install qemu-system qemu-system-gui qemu-efi-aarch64
   fi
   # vncsnapshot might not be available, though we don't want to abort execution then
-  sudo apt-get -qq -y install vncsnapshot || true
+  "${apt_get[@]}" -qq -y install vncsnapshot || true
   # Fetch goss directly from its GitHub release. The goss.rocks/install script
   # builds a non-existent 'goss_<ver>_linux_x86_64.tar.gz' URL (goss ships bare
   # 'goss-linux-<arch>' binaries), so it 404s and tar aborts. Pin the version,

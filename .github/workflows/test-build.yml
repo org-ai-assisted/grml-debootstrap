@@ -29,6 +29,8 @@ jobs:
 
     # We want a working shell, qemu, python and docker. Specific version should not matter (much).
     runs-on: ubuntu-latest
+    # Bounded so a stalled apt cannot sit on the default six-hour job limit.
+    timeout-minutes: 45
 
     # debian:unstable (sid) is a moving target whose build deps periodically
     # conflict; tolerate its failure so it does not fail the whole job and block
@@ -113,6 +115,8 @@ jobs:
 
     # We want a working shell, qemu, python and docker. Specific version should not matter (much).
     runs-on: ${{ matrix.runner }}
+    # Bounded so a stalled apt cannot sit on the default six-hour job limit.
+    timeout-minutes: 60
 
     # The unstable host build is allowed to fail (above), so its .deb artifact may
     # be missing; tolerate the resulting unstable test legs rather than failing the
@@ -221,6 +225,7 @@ jobs:
     # no .deb, so they gate early rather than behind build-debian.
     name: "Reproducible build checks (apt sources, SOURCE_DATE_EPOCH)"
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@v7
       with:
