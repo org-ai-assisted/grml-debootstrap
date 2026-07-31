@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Regression tests for tests/serial-console-connection.
+
+Standalone, no test framework and no pyserial required: the serial module is
+stubbed and the script under test is loaded by path.
+"""
+import contextlib
+import importlib.util
+import io
+import os
+import sys
+import types
+from importlib.machinery import SourceFileLoader
+
+HOSTNAME = "trixie"
+USER = "root"
+# distinctive, so a leak cannot be confused with anything else on stdout
+PASSWORD = "SuperSecretPassw0rdCanary"
+
+
+def load_script():
+    # the script has no .py suffix, so load it explicitly by path
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "serial-console-connection")
+    sys.modules.setdefault("serial", types.ModuleType("serial"))
+    loader = SourceFileLoader("serial_console_connection", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class FakeSerial:
+    """Answers each written line with the console output login() expects."""
+
+    def __init__(self):
+        self.timeout = None
+        self.pending = []
+        self.written = []
+
+    def write(self, data):
+        text = data.decode().rstrip("\n")
+        self.written.append(text)
+        if text == "":
+            self.pending.append(b"%s login: " % HOSTNAME.encode())
+        elif text == USER:
+            self.pending.append(b"Password: ")
+        elif text == PASSWORD:
+            self.pending.append(b"%s@%s:~# " % (USER.encode(), HOSTNAME.encode()))
+
+    def flush(self):
+        pass
+
+    def readlines(self):
+        lines = self.pending
+        self.pending = []
+        return lines
+
+
+def check(condition, description):
+    print("%s: %s" % ("PASS" if condition else "FAIL", description))
+    return condition
+
+
+def main():
+    module = load_script()
+    ser = FakeSerial()
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        module.login(ser, HOSTNAME, USER, PASSWORD, 5)
+        module.write_ser_line(ser, "uname -a")
+    logged = output.getvalue()
+
+    results = [
+        check(PASSWORD not in logged, "password is not echoed to stdout"),
+        check(">> ***" in logged, "password write is echoed as a mask"),
+        check(">> uname -a" in logged, "ordinary command is still echoed"),
+        check(PASSWORD in ser.written, "password is still sent over the serial line"),
+    ]
+
+    if not all(results):
+        print("E: %s of %s checks failed" % (results.count(False), len(results)))
+        print("captured stdout follows:")
+        print(logged)
+        return 1
+
+    print("%s checks passed, 0 failed, 0 skipped" % len(results))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

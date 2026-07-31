@@ -54,8 +54,9 @@ def print_ser_lines(ser):
         print("<<", line)  # line will be a binary string
 
 
-def write_ser_line(ser, text):
-    print(">>", text)
+def write_ser_line(ser, text, secret=False):
+    # secret=True keeps credentials out of the (public) CI job log
+    print(">>", "***" if secret else text)
     ser.write(("%s\n" % text).encode())
     ser.flush()
 
@@ -96,7 +97,7 @@ def login(ser, hostname, user, password, timeout):
     if not wait_ser_text(ser, "Password:", timeout=timeout):
         raise ValueError("timeout waiting for password prompt")
 
-    write_ser_line(ser, password)
+    write_ser_line(ser, password, secret=True)
     time.sleep(1)
 
     print(time.time(), "Waiting for shell prompt...")
