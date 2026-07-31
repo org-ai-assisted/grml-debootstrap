@@ -5,6 +5,11 @@ name: pr-review
 on:
   workflow_dispatch:
   pull_request:
+# reviewdog's github-pr-review reporter posts review comments on the pull
+# request, so it needs pull-requests: write.
+permissions:
+  contents: read
+  pull-requests: write
 jobs:
 
   shellcheck-code:
@@ -12,6 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Keep GITHUB_TOKEN out of .git/config; the third-party reviewdog
+          # step below receives its token explicitly.
+          persist-credentials: false
       - name: shellcheck
         uses: reviewdog/action-shellcheck@v1
         with:
@@ -30,6 +39,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Keep GITHUB_TOKEN out of .git/config; the third-party reviewdog
+          # step below receives its token explicitly.
+          persist-credentials: false
       - name: shellcheck
         uses: reviewdog/action-shellcheck@v1
         with:

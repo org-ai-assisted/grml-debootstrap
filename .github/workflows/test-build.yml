@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: '30 3 * * 2'
 
+# Both jobs only check out the tree and exchange artifacts within the same run,
+# which needs no GITHUB_TOKEN scope beyond reading the repository.
+permissions:
+  contents: read
+
 concurrency:
   group: "${{ github.ref }}"
   cancel-in-progress: true
@@ -27,6 +32,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+      with:
+        # Keep GITHUB_TOKEN out of .git/config; nothing here pushes.
+        persist-credentials: false
 
     - run: ./tests/gha-build-deb.sh
       name: "Build .deb for ${{matrix.host_release}}"
@@ -78,6 +86,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
+      with:
+        # Keep GITHUB_TOKEN out of .git/config; nothing here pushes.
+        persist-credentials: false
 
     - name: Download built deb
       uses: actions/download-artifact@v8
