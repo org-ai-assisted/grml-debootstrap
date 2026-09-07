@@ -35,14 +35,10 @@ trap "error_handler" ERR
 
 # variables {{{
 PN="$(basename "$0")"
-# Both lookups are allowed to fail -- the VERSION fallback below is what handles
-# that, and it is only reachable if they do not abort under errexit first. A git
-# checkout without tags (a shallow CI clone, a fresh clone before tags arrive)
-# makes 'git describe' fail, which otherwise kills the script on startup.
 if [[ -d "$(dirname "$(command -v "$0")")"/.git ]]; then
-  VERSION="$(git --git-dir "$(dirname "$(command -v "$0")")"/.git describe 2>/dev/null | sed 's|^v||')" || true
+  VERSION="$(git --git-dir "$(dirname "$(command -v "$0")")"/.git describe | sed 's|^v||')"
 else
-  VERSION="$(dpkg-query --show --showformat='${Version}' "$PN" 2>/dev/null)" || true
+  VERSION="$(dpkg-query --show --showformat='${Version}' "$PN")"
 fi
 VERSION="${VERSION:-unknown}"
 MNTPOINT="/mnt/debootstrap.$$"
@@ -54,6 +50,9 @@ FWBOOT_REIMAGE_TREE=''
 ROOTFS_REIMAGE_TREE=''
 RANDOM_HEX_BYTES_LIST=()
 RANDOM_HEX_BYTE_IDX=0
+FINAL_MIRROR=''
+FINAL_SECURITY_MIRROR=''
+SOURCE_DATE_EPOCH_PRETTY=''
 
 # defaults
 [ -n "$CHROOT_SCRIPTS" ] || CHROOT_SCRIPTS='yes'
@@ -69,6 +68,7 @@ RANDOM_HEX_BYTE_IDX=0
 [ -n "$ROOTPASSWORD_SALT" ] || ROOTPASSWORD_SALT='0'
 [ -n "$EXTRAPACKAGES" ] || EXTRAPACKAGES='yes'
 [ -n "$FALLBACK_MIRROR" ] || FALLBACK_MIRROR='http://deb.debian.org/debian'
+[ -n "$FALLBACK_SECURITY_MIRROR" ] || FALLBACK_SECURITY_MIRROR='http://security.debian.org/debian-security'
 [ -n "$FORCE" ] || FORCE=''
 [ -n "$HOSTNAME" ] || HOSTNAME='grml'
 [ -n "$INITRD" ] || INITRD='yes'
@@ -77,6 +77,7 @@ RANDOM_HEX_BYTE_IDX=0
 [ -n "$INSTALL_NOTES" ] || INSTALL_NOTES='/etc/debootstrap/install_notes'
 [ -n "$LOCALES" ] || LOCALES='yes'
 [ -n "$MIRROR" ] || MIRROR="$FALLBACK_MIRROR"
+[ -n "$SECURITY_MIRROR" ] || SECURITY_MIRROR="$FALLBACK_SECURITY_MIRROR"
 [ -n "$SNAPSHOT_ARCHIVE" ] || SNAPSHOT_ARCHIVE='https://snapshot.debian.org/archive'
 [ -n "$MKFS" ] || MKFS='mkfs.ext4'
 [ -n "$MKFS_OPTS" ] || MKFS_OPTS=''
@@ -184,6 +185,7 @@ Configuration options:
       --pre-scripts <dir>  Execute scripts from specified directory (before chroot-scripts).
       --scripts <dir>      Execute scripts from specified directory (after chroot-scripts).
       --remove-configs     Delete grml-debootstrap configuration files from installed system.
+      --no-reimage         Don't reimage filesystems even if doing a reproducible build.
 
 Other options:
 
@@ -310,12 +312,14 @@ try_umount() {
 cleanup() {
   # Make sure the reimage tree dir names look like actual temp dir names
   # before deleting them, so we don't accidentally destroy the user's data
+  # shellcheck disable=SC2076
   if [ -d "${FWBOOT_REIMAGE_TREE}" ] \
     && [[ "${FWBOOT_REIMAGE_TREE}" =~ '/tmp.' ]] ; then
     rm -rf "${FWBOOT_REIMAGE_TREE}"
   fi
+  # shellcheck disable=SC2076
   if [ -d "${ROOTFS_REIMAGE_TREE}" ] \
-    && [[ "${ROOTFS_REIMAGE_TREE}" =~ '/tmp.' ]]; then
+    && [[ "${ROOTFS_REIMAGE_TREE}" =~ '/tmp.' ]] ; then
     rm -rf "${ROOTFS_REIMAGE_TREE}"
   fi
 
@@ -330,7 +334,7 @@ cleanup() {
   try_umount 3 "${MNTPOINT}"/boot/efi
 
   # Remove temporary mountpoint again
-  if echo "$MNTPOINT" | grep -q '/mnt/debootstrap\.' ; then
+  if echo "$MNTPOINT" | grep --quiet '/mnt/debootstrap\.' ; then
     if [ -d "$MNTPOINT" ] ; then
       rmdir "$MNTPOINT" || true
     fi
@@ -338,7 +342,7 @@ cleanup() {
 
   # make sure $TARGET is not mounted when exiting grml-debootstrap
   if [ -n "$MNTPOINT" ] ; then
-    if grep -q "$MNTPOINT" /proc/mounts ; then
+    if grep --quiet "$MNTPOINT" /proc/mounts ; then
       # make sure nothing is left inside chroot so we can unmount it
       for service in ssh mdadm ; do
         if [ -x "${MNTPOINT}/etc/init.d/${service}" ] ; then
@@ -368,7 +372,7 @@ cleanup() {
       fi
 
       # remove directory only if we used the default with process id inside the name
-      if echo "$MNTPOINT" | grep -q '/mnt/debootstrap\.' ; then
+      if echo "$MNTPOINT" | grep --quiet '/mnt/debootstrap\.' ; then
         if [ -d "$MNTPOINT" ] ; then
           einfo "Removing directory ${MNTPOINT}"
           rmdir "$MNTPOINT" || eend $?
@@ -382,7 +386,7 @@ cleanup() {
     kpartx -d "${ORIG_TARGET}" || eend $?
     # Workaround for a bug in kpartx which doesn't clean up properly,
     # see Debian Bug #891077 and Github-PR grml/grml-debootstrap#112
-    if dmsetup ls | grep -q "^${LOOP_PART} "; then
+    if dmsetup ls | grep --quiet "^${LOOP_PART} "; then
       kpartx -d "/dev/${LOOP_DISK}" >/dev/null || eend $?
     fi
   fi
@@ -406,7 +410,7 @@ stage() {
   if [ -n "$2" ] ; then
      echo "$2" > "${STAGES}/${1}"
      return 0
-  elif grep -q 'done' "${STAGES}/${1}" 2>/dev/null ; then
+  elif grep --quiet 'done' "${STAGES}/${1}" 2>/dev/null ; then
      ewarn "Notice: stage $1 has been executed already, skipping execution therefore."
      ewarn "  To reexecute it clean up the according directory inside $STAGES"
      return 1
@@ -414,7 +418,7 @@ stage() {
 }
 
 # inverse-decrements ID_DERIVE_IDX, then xor's it with SOURCE_DATE_EPOCH to
-# get a seed number for generating reproducible psuedorandom IDs
+# get a seed number for generating reproducible pseudorandom IDs
 get_seed_from_sde() {
   local mask seed_target
 
@@ -559,7 +563,6 @@ insecure_password_salt_from_sde() {
   get_seed_from_sde seed
   gen_random_hex_bytes "${seed}" 24
   salt_str=''
-  hex_str=''
   rand_byte=''
   rand_val=''
   base64_digits='./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
@@ -574,11 +577,6 @@ insecure_password_salt_from_sde() {
   # more secure than no salt.
 
   for (( gen_idx = 0; gen_idx < 8; gen_idx++ )); do
-    ## Reset per iteration: appending without clearing makes the value exceed
-    ## 64 bits from the third pass on, where bash truncates it (silently, the
-    ## '|| true' below hides nothing since no error is raised), so the later
-    ## digits would derive from the low bytes of an ever-growing prefix
-    ## instead of from their own 24 fresh bits.
     hex_str=''
     for (( gen_sub_idx = 0; gen_sub_idx < 3; gen_sub_idx++ )); do
       get_random_hex_byte rand_byte
@@ -759,6 +757,9 @@ while :; do
   --remove-configs)    # Drop config files from installed system
     _opt_remove_configs=T
     ;;
+  --no-reimage)        # Skip reimaging the filesystems for reproducible builds
+    _opt_no_reimage=T
+    ;;
 
   # == Other options
   --verbose|-v)        # Increase verbosity
@@ -849,6 +850,7 @@ done
 [ "$_opt_verbose" ]             && VERBOSE="true"
 [ "$_opt_debug" ]               && DEBUG="true"
 [ "$_opt_remove_configs" ]      && REMOVE_CONFIGS="yes"
+[ "$_opt_no_reimage" ]          && NO_REIMAGE="yes"
 
 # make sure main is always included
 [ -z "$COMPONENTS" ]            && COMPONENTS="main"
@@ -875,23 +877,6 @@ if [ "$RPI" ] && [ -z "$ARCH" ]; then
   # Ensure the architecture for the build is set to arm64 even if building on
   # a non-arm64 machine, this is necessary for cross-builds to work
   ARCH='arm64'
-fi
-
-# Resolve the architecture here rather than only in the architecture setup block
-# further down: HAS_FWBOOT_PART below, and the mcopy/mdir check for reproducible
-# builds, both branch on it, and an unset ARCH made them read as "not arm64".
-# arm64 VM builds get VMEFI=1 (and thus a real ESP) inside prepare_image, so the
-# ESP went unregistered and was never rebuilt deterministically. Kept after the
-# Raspberry Pi block above, which pins arm64 for cross-builds. Failure stays
-# silent so the existing diagnostic below still reports an unresolvable arch.
-[ -n "$ARCH" ] || ARCH="$(dpkg --print-architecture 2>/dev/null || true)"
-
-if [ -n "${EFI}" ] \
-  || [ "${VMEFI}" = '1' ] \
-  || [ -n "${RPIFIRM}" ] \
-  || [ "${RPI}" = '1' ] \
-  || [ "${ARCH}" = 'arm64' ] ; then
-  HAS_FWBOOT_PART='yes'
 fi
 
 # RPi images *require* non-free-firmware as the raspi-firmware package resides
@@ -984,32 +969,30 @@ if [ -v SOURCE_DATE_EPOCH ] ; then
     bailout 1
   fi
   # Bash only supports 64-bit signed integers; if SOURCE_DATE_EPOCH is greater
-  # than INT64_MAX, it will wrap around and become negative. The wraparound check
-  # alone is not enough: at 2**64 and its multiples the value wraps back to 0 (or
-  # to some other positive number), which is not negative and would reach the
-  # build, where arithmetic contexts and date/touch/printf then disagree about
-  # what it means. INT64_MAX has 19 digits, so anything longer is out of range
-  # whatever it wraps to.
+  # than INT64_MAX, it will wrap around and become negative (or if it's so big
+  # that it becomes positive again, it will be longer than 19 digits).
   if [ "${#SOURCE_DATE_EPOCH}" -gt 19 ] || (( SOURCE_DATE_EPOCH < 0 )) ; then
     eerror "SOURCE_DATE_EPOCH is larger than INT64_MAX. Please unset it or set it to a smaller decimal integer."
     bailout 1
   fi
-  # A future timestamp cannot pin anything: snapshot.debian.org answers a
-  # request for it with the newest snapshot that exists when the request is
-  # made, so the same SOURCE_DATE_EPOCH keeps selecting newer packages as the
-  # archive grows. Refuse it rather than produce a silently unreproducible
-  # image, the same way a malformed value is refused.
-  if [ "${SOURCE_DATE_EPOCH}" -gt "$(date -u +%s)" ] ; then
-    eerror "SOURCE_DATE_EPOCH is in the future. Please set it to a past timestamp; a future one cannot select a fixed package set."
+  if [ "${SOURCE_DATE_EPOCH}" -gt "$(date +%s)" ]; then
+    eerror "SOURCE_DATE_EPOCH is in the future, which prevents downloading reproducible packages. Please set it to an earlier time."
     bailout 1
   fi
   if [ "${MKFS}" != 'mkfs.ext4' ] ; then
     eerror "SOURCE_DATE_EPOCH is set, but MKFS is not mkfs.ext4. Reproducible builds are only supported when using ext4."
     bailout 1
   fi
+  if [ "${USE_DEFAULT_INTERFACES}" != 'true' ]; then
+    eerror "SOURCE_DATE_EPOCH is set, but --defaultinterfaces was not passed! The resulting image would not be reproducible. Please add --defaultinterfaces to your command line."
+    bailout 1
+  fi
   if [ "$HOSTNAME" = "$(hostname)" ]; then
     ewarn "Attempting a reproducible build, but the image hostname is the same as the build host's. The image may not be reproducible."
   fi
+
+  SOURCE_DATE_EPOCH_PRETTY="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}" \
+    '+%Y%m%dT%H%M%SZ')"
 
   # Probably unnecessary, but just in case...
   export SOURCE_DATE_EPOCH
@@ -1043,13 +1026,10 @@ if [ -n "$VIRTUAL" ] ; then
 fi
 
 if [ -v SOURCE_DATE_EPOCH ] ; then
-  check4progs python3
+  check4progs python3 mcopy mdir || bailout 1
   if ! check_mke2fs_version; then
     eerror "Reproducible builds require e2fsprogs >= 1.47.1!"
     bailout 1
-  fi
-  if [ "${HAS_FWBOOT_PART}" = 'yes' ] ; then
-    check4progs mcopy mdir || bailout 1
   fi
 fi
 # }}}
@@ -1073,7 +1053,7 @@ if [ -n "$GROOT" ] ; then
    bailout 1
 fi
 
-if echo "$GRUB" | grep -q '^hd' ; then
+if echo "$GRUB" | grep --quiet '^hd' ; then
    eerror "Error: this syntax for the grub configuration variable is no longer supported."
    eerror "Please do not use hd... any longer but /dev/sdX instead."
    bailout 1
@@ -1120,7 +1100,7 @@ prompt_for_bootmanager()
 {
   ADDITIONAL_PARAMS=""
 
-  if echo "$TARGET" | grep -q "/dev/md" ; then
+  if echo "$TARGET" | grep --quiet "/dev/md" ; then
      MBRPART="all disks of Software RAID $TARGET"
   else
      # figure out whole disk device
@@ -1146,7 +1126,7 @@ prompt_for_bootmanager()
 
   for device in cciss/c0d0 sda hda; do
     if [ "/dev/$device" != "${MBRDISK}" ]; then
-      grep -q $device /proc/partitions && \
+      grep --quiet $device /proc/partitions && \
       ADDITIONAL_PARAMS="$ADDITIONAL_PARAMS:$device:install bootmanager grub into MBR of /dev/$device"
     fi
   done
@@ -1165,7 +1145,7 @@ prompt_for_bootmanager()
   case "$GETMBR" in
     mbr)
       # /dev/md0: has to be installed in MBR of /dev/md0 and not in /dev/md:
-      if echo "$TARGET" | grep -q "/dev/md" ; then
+      if echo "$TARGET" | grep --quiet "/dev/md" ; then
         GRUB="$TARGET"
       else
         GRUB="$MBRDISK"
@@ -1254,7 +1234,7 @@ TMPFILE=$(mktemp)
 RAIDLEVEL='raid1'
 
 MD_LIST=$(for i in $(seq 0 9) ; do
-            awk '{print $4}' /proc/partitions | grep -q "md$i" || \
+            awk '{print $4}' /proc/partitions | grep --quiet "md$i" || \
             echo "/dev/md$i /dev/md$i"
           done)
 
@@ -1379,21 +1359,34 @@ if [ -n "$INTERACTIVE" ] ; then
    INFOTEXT="Please recheck configuration before execution:
    "
    [ -n "$TARGET" ]  && INFOTEXT="$INFOTEXT
-   Target:          $TARGET"
+   Target:                $TARGET"
    [ -n "$GRUB" ]    && INFOTEXT="$INFOTEXT
-   Install grub:    $GRUB"
+   Install grub:          $GRUB"
    [ -n "$EFI" ]    && INFOTEXT="$INFOTEXT
-   Install efi:     $EFI"
+   Install efi:           $EFI"
    [ -n "$RELEASE" ] && INFOTEXT="$INFOTEXT
-   Using release:   $RELEASE"
+   Using release:         $RELEASE"
    [ -n "$HOSTNAME" ] && INFOTEXT="$INFOTEXT
-   Using hostname:  $HOSTNAME"
+   Using hostname:        $HOSTNAME"
    [ -n "$MIRROR" ]  && INFOTEXT="$INFOTEXT
-   Using mirror:    $MIRROR"
+   Using mirror:          $MIRROR"
+   [ -n "$SECURITY_MIRROR" ]  && INFOTEXT="$INFOTEXT
+   Using security mirror: $SECURITY_MIRROR"
    [ -n "$ARCH" ]  && INFOTEXT="$INFOTEXT
-   Using arch:      $ARCH"
+   Using arch:            $ARCH"
    [ -n "$CONFFILES" ] && INFOTEXT="$INFOTEXT
-   Config files:    $CONFFILES"
+   Config files:          $CONFFILES"
+   if [ -v SOURCE_DATE_EPOCH ]; then
+     INFOTEXT="$INFOTEXT
+   Reproducible build:    yes"
+     INFOTEXT="$INFOTEXT
+   Final mirror:          ${FINAL_MIRROR:-${MIRROR}}"
+     INFOTEXT="$INFOTEXT
+   Final security mirror: ${FINAL_SECURITY_MIRROR:-${SECURITY_MIRROR}}"
+   else
+     INFOTEXT="$INFOTEXT
+   Reproducible build:    no"
+   fi
 
    INFOTEXT="$INFOTEXT
 
@@ -1408,21 +1401,34 @@ else # if not running automatic installation display configuration and prompt fo
    echo "   Target:          $TARGET"
 
    # do not display if MNTPOINT is the default one
-   case "$MNTPOINT" in /mnt/debootstrap*) ;; *) echo "   Mount point:     $MNTPOINT" ;; esac
+   case "$MNTPOINT" in
+     /mnt/debootstrap*) ;;
+     *)                   echo "   Mount point:           $MNTPOINT" ;;
+   esac
 
    if [ -n "$VIRTUAL" ] && [ "$GRUB_INSTALL" = 'yes' ] ; then
-      echo "   Install grub:    yes"
-      [ -n "$VMEFI" ]   && echo "   Install efi:     yes"   || echo "   Install efi:     no"
+                          echo "   Install grub:          yes"
+      [ -n "$VMEFI" ]  && echo "   Install efi:           yes"   \
+                       || echo "   Install efi:           no"
    else
-     [ -n "$GRUB" ]     && echo "   Install grub:    $GRUB" || echo "   Install grub:    no"
-     [ -n "$EFI" ]      && echo "   Install efi:     $EFI"  || echo "   Install efi:     no"
+     [ -n "$GRUB" ]    && echo "   Install grub:          $GRUB" \
+                       || echo "   Install grub:          no"
+     [ -n "$EFI" ]     && echo "   Install efi:           $EFI"  \
+                       || echo "   Install efi:           no"
    fi
 
-   [ -n "$RELEASE" ]   && echo "   Using release:   $RELEASE"
-   [ -n "$HOSTNAME" ]  && echo "   Using hostname:  $HOSTNAME"
-   [ -n "$MIRROR" ]    && echo "   Using mirror:    $MIRROR"
-   [ -n "$ARCH" ]      && echo "   Using arch:      $ARCH"
-   [ -n "$CONFFILES" ] && echo "   Config files:    $CONFFILES"
+   [ -n "$RELEASE" ]   && echo "   Using release:         $RELEASE"
+   [ -n "$HOSTNAME" ]  && echo "   Using hostname:        $HOSTNAME"
+   [ -n "$MIRROR" ]    && echo "   Using mirror:          $MIRROR"
+   [ -n "$ARCH" ]      && echo "   Using arch:            $ARCH"
+   [ -n "$CONFFILES" ] && echo "   Config files:          $CONFFILES"
+   if [ -v SOURCE_DATE_EPOCH ]; then
+                          echo "   Reproducible build:    yes"
+                          echo "   Final mirror:          ${FINAL_MIRROR:-${MIRROR}}"
+                          echo "   Final security mirror: ${FINAL_SECURITY_MIRROR:-${SECURITY_MIRROR}}"
+   else
+                          echo "   Reproducible build:    no"
+   fi
    if [ -n "$VIRTUAL" ] ; then
       echo "   Deploying as Virtual Machine."
       if [ -n "$IMAGESIZE" ] && [ -n "$IMAGEFILE" ]; then
@@ -1508,6 +1514,16 @@ if [[ "$ARCH" != "amd64" ]] && [[ "$ARCH" != "arm64" ]] ; then
 fi
 # }}}
 
+# Detect if a firmware boot partition is going to exist (for reproducible builds). {{{
+if [ -n "${EFI}" ] \
+  || [ "${VMEFI}" = '1' ] \
+  || [ -n "${RPIFIRM}" ] \
+  || [ "${RPI}" = '1' ] \
+  || [ "${ARCH}" = 'arm64' ] ; then
+  HAS_FWBOOT_PART='yes'
+fi
+# }}}
+
 # Support for generic release codenames is unavailable. {{{
 if [ "$RELEASE" = "stable" ] || [ "$RELEASE" = "testing" ] ; then
    eerror "Generic release codenames (stable, testing) are unsupported. \
@@ -1516,35 +1532,25 @@ Please use specific codenames such as bookworm or trixie."
 fi
 # }}}
 
-# Verify that provided GRUB device actually exists{{{
+# Verify that provided GRUB device actually exists {{{
 if [ -n "${GRUB}" ] && ! [ -b "${GRUB}" ] ;  then
   eerror "GRUB target '${GRUB}' doesn't look like a supported block device."
   bailout 1
 fi
 # }}}
 
-# pin the package set to snapshot.debian.org for reproducible builds {{{
-# A mirror serves whatever is current, so pinning only the disk identifiers still
-# lets the same SOURCE_DATE_EPOCH select different package versions as the archive
-# moves on. snapshot.debian.org answers a request for an arbitrary timestamp with
-# the archive as it stood at that instant -- that is, the most recent snapshot at
-# or before it -- so the timestamp derived from SOURCE_DATE_EPOCH is itself the
-# selector and no snapshot listing has to be searched.
-#
-# This deliberately overrides both the default mirror and --mirror for the build.
-# The configured mirror is kept in FINAL_MIRROR and written into the target at the
-# end of the build, so the installed system tracks a real mirror, not the snapshot.
-# Done here, after interactive mode and config file sourcing, so it cannot be
-# overwritten afterwards and so the confirmation screen shows what is really used.
-if [ -v SOURCE_DATE_EPOCH ] ; then
-  FINAL_MIRROR="$MIRROR"
-  SNAPSHOT_TIMESTAMP="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}" +%Y%m%dT%H%M%SZ)"
-  MIRROR="${SNAPSHOT_ARCHIVE}/debian/${SNAPSHOT_TIMESTAMP}"
-  SNAPSHOT_SECURITY_MIRROR="${SNAPSHOT_ARCHIVE}/debian-security/${SNAPSHOT_TIMESTAMP}"
-  einfo "Reproducible build: installing from snapshot.debian.org as of ${SNAPSHOT_TIMESTAMP}, the installed system will use ${FINAL_MIRROR}" ; eend 0
+# Use snapshot mirrors for reproducible builds {{{
+if [ -v SOURCE_DATE_EPOCH ]; then
+  if ! [[ "${MIRROR}" =~ ^file: ]]; then
+    FINAL_MIRROR="$MIRROR"
+    MIRROR="${SNAPSHOT_ARCHIVE}/debian/${SOURCE_DATE_EPOCH_PRETTY}"
+  fi
+  if ! [[ "${SECURITY_MIRROR}" =~ ^file: ]]; then
+    FINAL_SECURITY_MIRROR="$SECURITY_MIRROR"
+    SECURITY_MIRROR="${SNAPSHOT_ARCHIVE}/debian-security/${SOURCE_DATE_EPOCH_PRETTY}"
+  fi
 fi
 # }}}
-
 checkconfiguration
 
 # finally make sure at least $TARGET is set [the partition for the new system] {{{
@@ -1564,7 +1570,7 @@ if [ -z "$STAGES" ] ; then
 fi
 
 if [ -r "$STAGES"/grml-debootstrap ] ; then
-   if grep -q 'done' "${STAGES}/grml-debootstrap" ; then
+   if grep --quiet 'done' "${STAGES}/grml-debootstrap" ; then
       eerror "Error: grml-debootstrap has been executed already, won't continue therefore."
       eerror "If you want to re-execute grml-debootstrap just manually remove ${STAGES}"
    fi
@@ -1608,7 +1614,7 @@ mkfs() {
      return 0
   fi
 
-  if grep -q "$TARGET" /proc/mounts ; then
+  if grep --quiet "$TARGET" /proc/mounts ; then
     eerror "$TARGET already mounted, exiting to avoid possible damage. (Manually unmount $TARGET)"
     bailout 1
   fi
@@ -1653,7 +1659,7 @@ mkfs() {
       einfo "Virtual environment doesn't require blockdev --rereadpt, skipping therefore"
     elif [ -n "$RPI" ] ; then
       einfo "Raspberry Pi image build doesn't require blockdev --rereadpt, skipping therefore"
-    elif echo "$TARGET" | grep -q "/dev/md" ; then
+    elif echo "$TARGET" | grep --quiet "/dev/md" ; then
       blockdev --rereadpt "${TARGET}"
     else
       # if we deploy to /dev/sdX# then let's see if /dev/sdX exists
@@ -1721,7 +1727,7 @@ mountpoint_to_blockdevice() {
 
   # $TARGET might be a mountpoint and not a blockdevice, search for according entry
   for file in /sys/block/*/*/dev ; do
-    if grep -q "^$(mountpoint -d "${TARGET}")$" "$file" ; then
+    if grep --quiet "^$(mountpoint -d "${TARGET}")$" "$file" ; then
       local dev
       dev="${file%/dev}"
       dev="/dev/${dev##*/}"
@@ -1738,7 +1744,7 @@ mountpoint_to_blockdevice() {
 
 # modify filesystem settings {{{
 tunefs() {
-  if [ -n "$TUNE2FS" ] && echo "$MKFS" | grep -q "mkfs.ext" ; then
+  if [ -n "$TUNE2FS" ] && echo "$MKFS" | grep --quiet "mkfs.ext" ; then
      einfo "Disabling automatic filesystem check on $TARGET via tune2fs"
      $TUNE2FS "$TARGET" </dev/null
   fi
@@ -1750,7 +1756,7 @@ mount_target() {
   if [ -n "$DIRECTORY" ] ; then
      einfo "Running grml-debootstrap on a directory, nothing to mount."
   else
-     if grep -q "$TARGET" /proc/mounts ; then
+     if grep --quiet "$TARGET" /proc/mounts ; then
         ewarn "$TARGET already mounted, continuing anyway."
      else
        if ! [ -d "${MNTPOINT}" ] ; then
@@ -1822,7 +1828,7 @@ prepare_image() {
   # if dm-mod isn't available then kpartx will fail with
   # "Is device-mapper driver missing from kernel? [...]"
   modprobe dm-mod || true
-  if ! grep -q 'device-mapper' /proc/misc >/dev/null 2>&1 ; then
+  if ! grep --quiet 'device-mapper' /proc/misc >/dev/null 2>&1 ; then
     eerror "Device-mapper support missing in kernel."
     bailout 1
   fi
@@ -1932,6 +1938,10 @@ prepare_image() {
 make_fwboot_part_reproducible() {
   local reimage_parent fwboot_part fwboot_name fwboot_object
 
+  if [ "${NO_REIMAGE}" = 'yes' ]; then
+    return 0
+  fi
+
   if [ "${HAS_FWBOOT_PART}" = 'no' ]; then
     return 0
   fi
@@ -1957,9 +1967,7 @@ make_fwboot_part_reproducible() {
   fi
 
   # Copy all files from the firmware boot partition to the reimage tree.
-  # MTOOLS_SKIP_CHECK: grub populates the ESP with a geometry mtools' consistency
-  # check rejects, which would abort the build under errexit.
-  MTOOLS_SKIP_CHECK=1 mcopy -i "${fwboot_part}" -s '::/.' "${FWBOOT_REIMAGE_TREE}/"
+  mcopy -i "${fwboot_part}" -s '::/.' "${FWBOOT_REIMAGE_TREE}/"
   if [ -z "$(ls -A "${FWBOOT_REIMAGE_TREE}")" ]; then
     eerror "No firmware boot files extracted from '${fwboot_part}'!"
     bailout 1
@@ -1979,7 +1987,7 @@ make_fwboot_part_reproducible() {
   # "Cannot create entry named . or ..". We have to copy the files and dirs
   # back one at a time.
   for fwboot_object in \
-    "${FWBOOT_REIMAGE_TREE}/"* \
+    "${FWBOOT_REIMAGE_TREE}"/* \
     "${FWBOOT_REIMAGE_TREE}"/.* ; do
     case "${fwboot_object##*/}" in
       '.'|'..'|'*'|'.*') continue ;;
@@ -1988,7 +1996,7 @@ make_fwboot_part_reproducible() {
       # This shouldn't ever happen...
       continue
     fi
-    MTOOLS_SKIP_CHECK=1 mcopy -i "${fwboot_part}" -s -m "${fwboot_object}" '::/'
+    mcopy -i "${fwboot_part}" -s -m "${fwboot_object}" '::/'
   done
 
   rm -rf "${FWBOOT_REIMAGE_TREE}"
@@ -1999,6 +2007,10 @@ make_fwboot_part_reproducible() {
 # save a snapshot of all files on the root filesystem {{{
 snapshot_root_filesystem() {
   local reimage_parent
+
+  if [ "${NO_REIMAGE}" = 'yes' ]; then
+    return 0
+  fi
 
   # This function has to be separate from the reimage_root_filesystem since
   # this runs before the root filesystem is unmounted, while
@@ -2014,13 +2026,8 @@ snapshot_root_filesystem() {
   ROOTFS_REIMAGE_TREE="$(mktemp -d -p "${reimage_parent}")"
 
   cp -a --one-file-system "${MNTPOINT}/." "${ROOTFS_REIMAGE_TREE}/"
-
-  # An empty snapshot means MNTPOINT was not the live mount; re-imaging from it
-  # would mkfs over a working installation and silently produce an unbootable
-  # image (the reproducibility comparison still passes, since both images are
-  # equally empty). Mirrors the firmware boot partition guard above.
-  if [ -z "$(ls -A "${ROOTFS_REIMAGE_TREE}")" ]; then
-    eerror "Root filesystem snapshot from '${MNTPOINT}' is empty, refusing to re-image '${TARGET}'!"
+  if [ -z "$(ls -A "${ROOTFS_REIMAGE_TREE}")" ] ; then
+    eerror "Root filesystem snapshot from '${MNTPOINT}' is empty!"
     bailout 1
   fi
 }
@@ -2029,6 +2036,10 @@ snapshot_root_filesystem() {
 # re-image the root filesystem deterministically from the snapshot {{{
 reimage_root_filesystem() {
   local current_uuid
+
+  if [ "${NO_REIMAGE}" = 'yes' ]; then
+    return 0
+  fi
 
   if [ -z "${ROOTFS_REIMAGE_TREE}" ] \
     || ! [ -d "${ROOTFS_REIMAGE_TREE}" ] ; then
@@ -2041,80 +2052,19 @@ reimage_root_filesystem() {
     bailout 1
   fi
 
-  # --force already appended -F to MKFS_OPTS, so the -F below is the *second*
-  # one, and two -F tell mke2fs to format even while mounted -- it will not
-  # refuse. try_umount above only handles $MNTPOINT, but the target can be
-  # mounted elsewhere too (udisks picking up the kpartx mapper node, a stale
-  # manual mount, a systemd mount unit), so clear every mountpoint it has.
-  local target_mountpoints mountpoint umount_tries
-  umount_tries=0
-  while true ; do
-    # findmnt exits 1 when the source has no mountpoints at all, which is the
-    # success case here; keep that benign under errexit and the ERR trap.
-    readarray -t target_mountpoints \
-      < <(findmnt -rn -o TARGET --source "${TARGET}" 2>/dev/null || true)
-    [ "${#target_mountpoints[@]}" -eq 0 ] && break
-    if [ "${umount_tries}" -ge 10 ] ; then
-      eerror "Failed to unmount '${TARGET}' after 10 attempts, refusing to re-image it!"
-      bailout 1
-    fi
-    for mountpoint in "${target_mountpoints[@]}" ; do
-      umount "${mountpoint}" 2>/dev/null || true
-    done
-    umount_tries=$(( umount_tries + 1 ))
-    sleep 1
-  done
-
+  # Make sure to only pass -F once. This will keep mkfs.ext4 from overwriting
+  # the filesystem if it is mounted somewhere already.
+  local force_maybe
+  if printf '%s' "${MKFS_OPTS}" | grep --quiet --word-regexp -- '-F'; then
+    force_maybe=()
+  else
+    force_maybe=( '-F' )
+  fi
   # shellcheck disable=SC2086
-  "${MKFS}" ${MKFS_OPTS} -d "${ROOTFS_REIMAGE_TREE}" -F "${TARGET}"
+  "${MKFS}" ${MKFS_OPTS} -d "${ROOTFS_REIMAGE_TREE}" "${force_maybe[@]}" "${TARGET}"
   rm -rf "${ROOTFS_REIMAGE_TREE}"
   ROOTFS_REIMAGE_TREE=''
   tunefs
-}
-# }}}
-
-# does the reproducible post-processing apply to this build? {{{
-reproducible_image_build() {
-  # The snapshot / re-image / ESP-rebuild path rewrites the target filesystem
-  # wholesale from a staging copy. That is fine for a VM or Raspberry Pi image
-  # file, but $PARTITION alone is also true for a bare-metal install onto a real
-  # block device, where it would mkfs over the user's disk at the very end of an
-  # otherwise finished install. Restrict it to image builds, the same way the
-  # kpartx teardown in umount_chroot is restricted.
-  [ -v SOURCE_DATE_EPOCH ] || return 1
-  [ -n "${VIRTUAL}" ] || [ -n "${RPI}" ]
-}
-# }}}
-
-# pin the root filesystem superblock timestamps {{{
-normalize_root_superblock() {
-  local sde_hex sde_cmd debugfs_err
-
-  # Required for byte-for-byte reproducibility: mke2fs -d, and the tune2fs run
-  # tunefs does afterwards, leave the superblock's last-mount / write / check
-  # times and the lifetime-writes counter at build-varying values. libext2fs
-  # honours SOURCE_DATE_EPOCH for the time fields, but kbytes_written is a byte
-  # counter, not a timestamp, and is not covered by it. Verified: removing this
-  # step makes the reproducible-build comparison fail while the image still boots.
-  einfo "Normalizing the root filesystem superblock"
-
-  # Hex because debugfs misparses large decimal values.
-  sde_hex="$(printf '0x%x' "${SOURCE_DATE_EPOCH}")"
-  # Field names carry no 's_' prefix; an 's_'-prefixed name is rejected outright.
-  for sde_cmd in "set_super_value mtime ${sde_hex}" \
-                 "set_super_value wtime ${sde_hex}" \
-                 "set_super_value lastcheck ${sde_hex}" \
-                 "set_super_value kbytes_written 0" ; do
-    # debugfs exits 0 even when set_super_value fails internally, so inspect its
-    # stderr and bail out on a real error.
-    debugfs_err="$(debugfs -w -R "${sde_cmd}" "${TARGET}" 2>&1 1>/dev/null)"
-    case "${debugfs_err}" in
-      *"set_super_value:"*)
-        eerror "debugfs rejected '${sde_cmd}' on '${TARGET}': ${debugfs_err}"
-        bailout 1
-        ;;
-    esac
-  done
 }
 # }}}
 
@@ -2125,7 +2075,7 @@ debootstrap_system() {
      return
   fi
 
-  if grep -q "$MNTPOINT" /proc/mounts || [ -n "$DIRECTORY" ] ; then
+  if grep --quiet "$MNTPOINT" /proc/mounts || [ -n "$DIRECTORY" ] ; then
     :
   else
     eerror "Error: $MNTPOINT not mounted, can not continue."
@@ -2137,12 +2087,7 @@ debootstrap_system() {
   bootstrap_include='--include=ca-certificates'
 
   local -a bootstrap_aptopt=()
-  if [ -v SOURCE_DATE_EPOCH ] ; then
-    # snapshot.debian.org serves the archived Release files of the day, whose
-    # Valid-Until has long passed for anything but a very recent snapshot; apt
-    # rejects them as expired without this.
-    bootstrap_aptopt=(--aptopt='Acquire::Check-Valid-Until "false"')
-  fi
+  [ -v SOURCE_DATE_EPOCH ] && bootstrap_aptopt+=( '--aptopt=Acquire::Check-Valid-Until "false"' )
 
   einfo "Running mmdebstrap $DEBOOTSTRAP_OPT for release ${RELEASE}${ARCHINFO} using ${MIRROR}"
   einfo "Executing: mmdebstrap --skip=cleanup/apt --skip=check/empty ${bootstrap_aptopt[*]} $bootstrap_include $ARCHCMD $DEBOOTSTRAP_OPT $RELEASE $MNTPOINT $MIRROR"
@@ -2204,16 +2149,18 @@ preparechroot() {
   [ -n "$CHROOT_SCRIPTS" ]            && echo "CHROOT_SCRIPTS='${CHROOT_SCRIPTS//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$COMPONENTS" ]                && echo "COMPONENTS='${COMPONENTS//\'/\'\\\'\'}'"                             >> "$CHROOT_VARIABLES"
   [ -n "$CONFFILES" ]                 && echo "CONFFILES='${CONFFILES//\'/\'\\\'\'}'"                               >> "$CHROOT_VARIABLES"
+  [ -n "$DPKG_OPTIONS" ]              && echo "DPKG_OPTIONS='${DPKG_OPTIONS//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
   [ -n "$DEBCONF" ]                   && echo "DEBCONF='${DEBCONF//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$DEBIAN_FRONTEND" ]           && echo "DEBIAN_FRONTEND='${DEBIAN_FRONTEND//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$DEFAULT_LOCALES" ]           && echo "DEFAULT_LOCALES='${DEFAULT_LOCALES//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$DEFAULT_LANGUAGE" ]          && echo "DEFAULT_LANGUAGE='${DEFAULT_LANGUAGE//\'/\'\\\'\'}'"                 >> "$CHROOT_VARIABLES"
-  [ -n "$DPKG_OPTIONS" ]              && echo "DPKG_OPTIONS='${DPKG_OPTIONS//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
   [ -n "$EXTRAPACKAGES" ]             && echo "EXTRAPACKAGES='${EXTRAPACKAGES//\'/\'\\\'\'}'"                       >> "$CHROOT_VARIABLES"
   [ -n "$EFI" ]                       && echo "EFI='${EFI//\'/\'\\\'\'}'"                                           >> "$CHROOT_VARIABLES"
   [ -n "$FALLBACK_MIRROR" ]           && echo "FALLBACK_MIRROR='${FALLBACK_MIRROR//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
-  [ -n "$FINAL_MIRROR" ]              && echo "FINAL_MIRROR='${FINAL_MIRROR//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
+  [ -n "$FALLBACK_SECURITY_MIRROR" ]  && echo "FALLBACK_SECURITY_MIRROR='${FALLBACK_SECURITY_MIRROR//\'/\'\\\'\'}'" >> "$CHROOT_VARIABLES"
   [ -n "$FILESYSTEM" ]                && echo "FILESYSTEM='${FILESYSTEM//\'/\'\\\'\'}'"                             >> "$CHROOT_VARIABLES"
+  [ -n "$FINAL_MIRROR" ]              && echo "FINAL_MIRROR='${FINAL_MIRROR//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
+  [ -n "$FINAL_SECURITY_MIRROR" ]     && echo "FINAL_SECURITY_MIRROR='${FINAL_SECURITY_MIRROR//\'/\'\\\'\'}'"       >> "$CHROOT_VARIABLES"
   [ -n "$FORCE" ]                     && echo "FORCE='${FORCE//\'/\'\\\'\'}'"                                       >> "$CHROOT_VARIABLES"
   [ -n "$GRMLREPOS" ]                 && echo "GRMLREPOS='${GRMLREPOS//\'/\'\\\'\'}'"                               >> "$CHROOT_VARIABLES"
   [ -n "$GRUB" ]                      && echo "GRUB='${GRUB//\'/\'\\\'\'}'"                                         >> "$CHROOT_VARIABLES"
@@ -2241,9 +2188,9 @@ preparechroot() {
   [ -n "$ROOTPASSWORD_SALT" ]         && echo "ROOTPASSWORD_SALT='${ROOTPASSWORD_SALT//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$SCRIPTS" ]                   && echo "SCRIPTS='${SCRIPTS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$SECURE" ]                    && echo "SECURE='${SECURE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
+  [ -n "$SECURITY_MIRROR" ]           && echo "SECURITY_MIRROR='${SECURITY_MIRROR//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$SELECTED_PARTITIONS" ]       && echo "SELECTED_PARTITIONS='${SELECTED_PARTITIONS//\'/\'\\\'\'}'"           >> "$CHROOT_VARIABLES"
-  [ -n "$SNAPSHOT_SECURITY_MIRROR" ]  && echo "SNAPSHOT_SECURITY_MIRROR='${SNAPSHOT_SECURITY_MIRROR//\'/\'\\\'\'}'" >> "$CHROOT_VARIABLES"
-  [ -v SOURCE_DATE_EPOCH ]            && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
+  [ -n "$SOURCE_DATE_EPOCH" ]         && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$TARGET" ]                    && echo "TARGET='${TARGET//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$UPGRADE_SYSTEM" ]            && echo "UPGRADE_SYSTEM='${UPGRADE_SYSTEM//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$TARGET_UUID" ]               && echo "TARGET_UUID='${TARGET_UUID//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
@@ -2332,14 +2279,14 @@ iface eth0 inet dhcp
 
       udevadm info --query=all --path="${interface}" > "${tmpfile}"
       # skip virtual devices, like bridges, vboxnet,...
-      if grep -q 'P: /devices/virtual/net/' "${tmpfile}" ; then
+      if grep --quiet 'P: /devices/virtual/net/' "${tmpfile}" ; then
         continue
       fi
 
       # iterate over possible naming policies by precedence (see udev/net/link-config.c),
       # use and stop on first match to have same behavior as udev's link_config_apply()
       for property in ID_NET_NAME_FROM_DATABASE ID_NET_NAME_ONBOARD ID_NET_NAME_SLOT ID_NET_NAME_PATH ID_NET_NAME_MAC ; do
-        if grep -q "${property}" "${tmpfile}" ; then
+        if grep --quiet "${property}" "${tmpfile}" ; then
           interface=$(grep "${property}" "${tmpfile}" | sed -n -e "s/E: ${property}=\([^\$*]\)/\1/p")
           DEFAULT_INTERFACES="${DEFAULT_INTERFACES}
 allow-hotplug ${interface}
@@ -2502,7 +2449,7 @@ chrootscript() {
 
   # finally get rid of chroot-script again, there's no good reason to
   # keep it on the installed system
-  if grep -q GRML_CHROOT_SCRIPT_MARKER "${MNTPOINT}/bin/chroot-script" ; then
+  if grep --quiet GRML_CHROOT_SCRIPT_MARKER "${MNTPOINT}/bin/chroot-script" ; then
     einfo "Removing chroot-script again"
     rm -f "${MNTPOINT}/bin/chroot-script"
   else
@@ -2521,27 +2468,26 @@ umount_chroot() {
 
   try_umount 3 "${MNTPOINT}"/boot/efi
   try_umount 3 "${MNTPOINT}"/boot/firmware
-  if reproducible_image_build && [ "${HAS_FWBOOT_PART}" = 'yes' ] ; then
+  if [ -v SOURCE_DATE_EPOCH ] && [ "${HAS_FWBOOT_PART}" = 'yes' ] ; then
     make_fwboot_part_reproducible
   fi
 
   try_umount 3 "${MNTPOINT}"/run/udev
 
   if [ -n "$PARTITION" ] ; then
-    if reproducible_image_build ; then
+    if [ -v SOURCE_DATE_EPOCH ] ; then
       snapshot_root_filesystem
     fi
     try_umount 3 "$MNTPOINT"
-    if reproducible_image_build ; then
+    if [ -v SOURCE_DATE_EPOCH ] ; then
       reimage_root_filesystem
-      normalize_root_superblock
     fi
 
     if [ -n "${VIRTUAL}" ] || [ -n "$RPI" ] ; then
       kpartx -d "${ORIG_TARGET}" >/dev/null
       # Workaround for a bug in kpartx which doesn't clean up properly,
       # see Debian Bug #891077 and Github-PR grml/grml-debootstrap#112
-      if dmsetup ls | grep -q "^${LOOP_PART} "; then
+      if dmsetup ls | grep --quiet "^${LOOP_PART} " ; then
         kpartx -d "/dev/${LOOP_DISK}" >/dev/null
       fi
     fi

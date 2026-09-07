@@ -91,7 +91,7 @@ jobs:
 
           ---
 
-          📦 **Installation:**
+          **Installation:**
           Download the package and install with:
           \`\`\`bash
           sudo apt install ./${DEB_FILE}

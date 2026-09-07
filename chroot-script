@@ -68,7 +68,7 @@ stage() {
   if [ -n "$2" ] ; then
      echo "$2" > "$STAGES/$1"
      return 0
-  elif grep -q 'done' "$STAGES/$1" 2>/dev/null ; then
+  elif grep --quiet 'done' "$STAGES/$1" 2>/dev/null ; then
      echo "   [*] Notice: stage $1 has been executed already, skipping execution therefore.">&2
      return 1
   fi
@@ -106,9 +106,6 @@ writesource() {
   suites="${4:-}"
   components="${5:-}"
   signed_by="${6:-}"
-  # 'no' for snapshot.debian.org sources, whose archived Release files are long
-  # past their Valid-Until. Set per source rather than globally so it applies to
-  # exactly the snapshot stanzas and disappears with them.
   check_valid_until="${7:-}"
 
   mkdir -p "$(dirname "${file}")"
@@ -134,6 +131,10 @@ writesource() {
 # define chroot mirror {{{
 # shellcheck disable=SC2329
 chrootmirror() {
+  local omit_check_valid_until check_valid_until
+  omit_check_valid_until="${1:-}"
+  check_valid_until=''
+
   if [ "$KEEP_SRC_LIST" = "yes" ] ; then
     echo "KEEP_SRC_LIST has been enabled, skipping chrootmirror stage."
     return
@@ -144,37 +145,34 @@ chrootmirror() {
   fi
   echo "Using repository components $COMPONENTS"
 
-  # During a reproducible build MIRROR points at a snapshot.debian.org archive,
-  # whose Release files are past their Valid-Until, and the matching security
-  # archive is the snapshot one rather than the live security.debian.org.
-  local build_check_valid_until security_mirror
-  build_check_valid_until=''
-  security_mirror='http://security.debian.org/debian-security'
-  if [ -v SOURCE_DATE_EPOCH ] ; then
-    build_check_valid_until='no'
-    [ -n "$SNAPSHOT_SECURITY_MIRROR" ] && security_mirror="$SNAPSHOT_SECURITY_MIRROR"
-  fi
+  [ -v SOURCE_DATE_EPOCH ] && [ -z "${omit_check_valid_until}" ] \
+    && check_valid_until='no'
 
   if [ -n "$MIRROR" ] ; then
     echo "Deleting obsolete sources.list"
     rm -f /etc/apt/sources.list
 
-    if grep -q 'file:' <<< "$MIRROR" ; then
+    if grep --quiet 'file:' <<< "$MIRROR" ; then
       echo "Adjusting sources.list.d/local.sources for mirror (${MIRROR})."
-      writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "$build_check_valid_until"
+      writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
     else
       echo "Adjusting sources.list.d/debian.sources for mirror (${MIRROR})."
-      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "$build_check_valid_until"
+      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
     fi
   fi
 
-  # add security.debian.org:
+  # add security mirror:
   case "$RELEASE" in
     unstable|sid) ;;  # no security pool available
     *)
       # https://lists.debian.org/debian-devel-announce/2019/07/msg00004.html
-      echo "Adding ${security_mirror} to sources.list.d/debian.sources."
-      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$security_mirror" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "$build_check_valid_until"
+      if grep --quiet 'file:' <<< "$SECURITY_MIRROR" ; then
+        echo "Adding security mirror to sources.list.d/local.sources."
+        writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+      else
+        echo "Adding security mirror to sources.list.d/debian.sources."
+        writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+      fi
       ;;
   esac
 }
@@ -188,91 +186,19 @@ remove_chrootmirror() {
     return
   fi
 
-  if [ -n "$MIRROR" ] && echo "$MIRROR" | grep -q 'file:' ; then
+  if [ -n "$MIRROR" ] && echo "$MIRROR" | grep --quiet 'file:' ; then
     echo "Removing local.sources."
-    rm /etc/apt/sources.list.d/local.sources
+    rm -f /etc/apt/sources.list.d/local.sources
     echo "Adding fallback mirror entry (${FALLBACK_MIRROR}) to sources.list.d/debian.sources instead."
     writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FALLBACK_MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
   fi
-}
-# }}}
 
-# point one sources file back at the runtime mirror {{{
-# Rewrites only what this build put there: stages that ran earlier,
-# custom_scripts in particular, may have added their own stanzas, and a normal
-# build keeps those. Whole-line matching rather than sed, so a mirror URL
-# containing '&', '|' or a regex metacharacter cannot corrupt the result or
-# abort the run.
-rewrite_snapshot_sources() {
-  local runtime_mirror sources_file line snapshot_stanza
-  runtime_mirror="$1"
-  sources_file="$2"
-  ## Whether the stanza being read is one this build wrote. writesource always
-  ## emits URIs before Check-Valid-Until, so this is known by the time the
-  ## latter is reached, and a stanza someone else added keeps its own fields.
-  snapshot_stanza='no'
-
-  while IFS= read -r line ; do
-    case "$line" in
-      '')
-        snapshot_stanza='no' ;;
-      "URIs: ${MIRROR}")
-        line="URIs: ${runtime_mirror}"
-        snapshot_stanza='yes' ;;
-      "URIs: ${SNAPSHOT_SECURITY_MIRROR}")
-        line='URIs: http://security.debian.org/debian-security'
-        snapshot_stanza='yes' ;;
-      "deb ${MIRROR} "*)
-        line="deb ${runtime_mirror} ${line#"deb ${MIRROR} "}" ;;
-      'Check-Valid-Until: no')
-        [ "$snapshot_stanza" = 'no' ] || continue ;;
-    esac
-    printf '%s\n' "$line"
-  done < "$sources_file" > "${sources_file}.tmp"
-
-  cat "${sources_file}.tmp" > "$sources_file"
-  rm -f "${sources_file}.tmp"
-}
-# }}}
-
-# replace the snapshot.debian.org build sources with the configured mirror {{{
-# shellcheck disable=SC2329
-restore_snapshot_mirror() {
-  # Only reproducible builds install from a snapshot; FINAL_MIRROR carries the
-  # mirror the user actually asked for (default or --mirror).
-  [ -v SOURCE_DATE_EPOCH ] || return 0
-  [ -n "$FINAL_MIRROR" ] || return 0
-
-  local runtime_mirror sources_file
-  runtime_mirror="$FINAL_MIRROR"
-  # A local build mirror is not reachable from the installed system. This is
-  # what remove_chrootmirror does for a non-reproducible build; it cannot do it
-  # here because MIRROR holds the snapshot URL by this point, so its 'file:'
-  # test never matches.
-  if grep -q 'file:' <<< "$runtime_mirror" ; then
-    echo "Configured mirror (${runtime_mirror}) is local, using the fallback mirror (${FALLBACK_MIRROR}) instead."
-    runtime_mirror="$FALLBACK_MIRROR"
+  if [ -n "$SECURITY_MIRROR" ] && echo "$SECURITY_MIRROR" | grep --quiet 'file:' ; then
+    echo "Removing local.sources if necessary."
+    rm -rf /etc/apt/sources.list.d/local.sources
+    echo "Adding fallback security mirror entry (${FALLBACK_SECURITY_MIRROR}) to sources.list.d/debian.sources instead."
+    writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FALLBACK_SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
   fi
-
-  echo "Replacing snapshot build sources with the configured mirror (${runtime_mirror})."
-  for sources_file in /etc/apt/sources.list \
-    /etc/apt/sources.list.d/debian.sources \
-    /etc/apt/sources.list.d/backports.sources ; do
-    [ -f "$sources_file" ] || continue
-    rewrite_snapshot_sources "$runtime_mirror" "$sources_file"
-  done
-
-  # The package indices were fetched from the snapshot: they carry its expired
-  # Valid-Until and no longer describe the mirror just written, so the first
-  # apt update on the booted system would fail on them. apt-get clean does not
-  # touch these (it only clears /var/cache/apt/archives), and mmdebstrap was
-  # deliberately run with --skip=cleanup/apt, so they are still present here.
-  # Removing them is also what keeps snapshot-derived state out of the image.
-  # Only the contents go: recreating the directories would lose apt's _apt
-  # ownership and 0700 mode on partial/, leaving apt unable to drop privileges
-  # for downloads on the installed system.
-  find /var/lib/apt/lists -mindepth 1 -maxdepth 1 ! -name partial -exec rm -rf {} +
-  find /var/lib/apt/lists/partial -mindepth 1 -delete 2>/dev/null || true
 }
 # }}}
 
@@ -323,11 +249,13 @@ EOF
 # shellcheck disable=SC2329
 backportrepos() {
   if [ -n "$BACKPORTREPOS" ] ; then
-    local backports_check_valid_until=''
-    # see chrootmirror(): MIRROR is a snapshot archive during reproducible builds
-    [ -v SOURCE_DATE_EPOCH ] && backports_check_valid_until='no'
+    local omit_check_valid_until check_valid_until
+    omit_check_valid_until="${1:-}"
+    check_valid_until=''
+    [ -v SOURCE_DATE_EPOCH ] && [ -z "${omit_check_valid_until}" ] \
+      && check_valid_until='no'
     echo "# debian backports: ${RELEASE}-backports repository:" >> /etc/apt/sources.list.d/backports.sources
-    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg' "$backports_check_valid_until"
+    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
   fi
 }
 # }}}
@@ -490,7 +418,7 @@ rpi_cmdline() {
 reconfigure() {
   if [ -n "$RECONFIGURE" ] ; then
      for package in $RECONFIGURE ; do
-         if dpkg --list "$package" 2>/dev/null | grep -q '^ii' ; then
+         if dpkg --list "$package" 2>/dev/null | grep --quiet '^ii' ; then
            DEBIAN_FRONTEND=$DEBIAN_FRONTEND dpkg-reconfigure "$package" || \
            echo "Warning: $package does not exist, can not reconfigure it."
          fi
@@ -668,7 +596,7 @@ EOF
 # shellcheck disable=SC2329
 fstab() {
   # set up /etc/fstab if file is UNCONFIGURED (debootstrap, mmdebstrap)
-  if grep -q UNCONFIGURED /etc/fstab ; then
+  if grep --quiet UNCONFIGURED /etc/fstab ; then
      createfstab
   fi
 }
@@ -690,7 +618,7 @@ install_fs_tools() {
       ;;
   esac
 
-  if [ -n "${pkg:-}" ] && ! dpkg --list "${pkg}" 2>/dev/null | grep -q '^ii' ; then
+  if [ -n "${pkg:-}" ] && ! dpkg --list "${pkg}" 2>/dev/null | grep --quiet '^ii' ; then
     echo "Filesystem package ${pkg} not present, installing now"
     DEBIAN_FRONTEND=$DEBIAN_FRONTEND $APTINSTALL "${pkg}"
   fi
@@ -711,7 +639,7 @@ hostname() {
 
         # listen on loopback interface only:
         sed -i "s/^inet_interfaces = .*/inet_interfaces = loopback-only/" /etc/postfix/main.cf
-        grep -q inet_interfaces /etc/postfix/main.cf || echo 'inet_interfaces = loopback-only' >> /etc/postfix/main.cf
+        grep --quiet inet_interfaces /etc/postfix/main.cf || echo 'inet_interfaces = loopback-only' >> /etc/postfix/main.cf
      fi
      if [ -r /etc/mailname ] ; then
         # adjust /etc/mailname
@@ -765,7 +693,7 @@ efi_setup() {
     return 0
   fi
 
-  if ! dpkg --list efibootmgr 2>/dev/null | grep -q '^ii' ; then
+  if ! dpkg --list efibootmgr 2>/dev/null | grep --quiet '^ii' ; then
     echo "Notice: efi option set but no efibootmgr package, installing it therefore."
     DEBIAN_FRONTEND=$DEBIAN_FRONTEND $APTINSTALL efibootmgr
   fi
@@ -835,16 +763,10 @@ is_grub_bios_compatible() {
   else
     # Scanning the output of lsblk is unreliable in some environments. partx
     # seems to work better.
-    # Matched case-insensitively and tolerating column padding: a missed match
-    # silently selects grub-efi over grub-cloud, i.e. a BIOS-unbootable image
-    # rather than an error.
     local partx_types
-    # A partx failure ($GRUB not a whole disk, unreadable label, partx missing)
-    # means "cannot tell", not "abort the build": without the guard the failing
-    # assignment trips the ERR trap and kills the whole chroot run.
-    partx_types="$(partx --show --noheadings --output TYPE "$GRUB" 2>&1)" || true
-    if [[ "${partx_types,,}" \
-      =~ (^|$'\n')[[:space:]]*21686148-6449-6e6f-744e-656564454649[[:space:]]*($'\n'|$) ]]; then
+    partx_types="$(partx --show --noheadings --output TYPE "$GRUB")" || true
+    if [[ "${partx_types}" \
+      =~ (^|$'\n')21686148-6449-6e6f-744e-656564454649($'\n'|$) ]]; then
       return 0
     fi
   fi
@@ -1013,6 +935,24 @@ reproducible_finalize() {
   [ -v SOURCE_DATE_EPOCH ] || return 0
   echo "Applying reproducible-build finalization."
 
+  # Regenerate apt sources with their final values.
+  if [ -n "${FINAL_MIRROR}" ]; then
+    MIRROR="${FINAL_MIRROR}"
+  fi
+  if [ -n "${FINAL_SECURITY_MIRROR}" ]; then
+    SECURITY_MIRROR="${FINAL_SECURITY_MIRROR}"
+  fi
+  rm -f '/etc/apt/sources.list.d/debian.sources'
+  rm -f '/etc/apt/sources.list.d/backports.sources'
+  chrootmirror 'omit-check-valid-until'
+  backportrepos 'omit-check-valid-until'
+  remove_chrootmirror
+
+  # stale apt repository information
+  find /var/lib/apt/lists -mindepth 1 -maxdepth 1 -type f -delete
+  find /var/lib/apt/lists/auxfiles -mindepth 1 -maxdepth 1 -type f -delete
+  find /var/lib/apt/lists/partial -mindepth 1 -maxdepth 1 -type f -delete
+
   # SSH host keys
   rm -f /etc/ssh/ssh_host_*
 
@@ -1027,41 +967,6 @@ reproducible_finalize() {
   # machine-id
   printf 'uninitialized\n' > /etc/machine-id
   rm -f /var/lib/dbus/machine-id # copied from /etc/machine-id on boot
-
-  # The debconf database (/var/cache/debconf/config.dat) is deliberately NOT removed
-  # -- it holds real configured answers and 'seen' flags, not a regenerable cache. It
-  # carries one build-varying value: grub records its install device as the ephemeral
-  # build loop device (/dev/loopN), whose number depends on host loop allocation.
-  # Canonicalize just that answer to a stable placeholder using debconf's own tooling
-  # rather than editing config.dat by hand (a hand-edit can corrupt the database and
-  # misses debconf's on-disk encoding). The value is meaningless on the deployed
-  # system (a different disk, reset on first configure), so only its determinism
-  # matters. Re-set every grub *_install_devices answer debconf currently holds; the
-  # owning package is the part of the key before the '/'.
-  #
-  # Only answers naming a loop or device-mapper node are touched. A bare-metal
-  # install records the real disk there, which is neither build-varying nor
-  # meaningless: overwriting it would point the next grub package upgrade at a
-  # device that does not exist, leaving the bootloader unrefreshed.
-  local install_devices_key install_devices_value
-  while read -r install_devices_key; do
-    [ -n "$install_devices_key" ] || continue
-    install_devices_value="$(debconf-show "${install_devices_key%%/*}" 2>/dev/null \
-      | sed -n "s|^[* ] ${install_devices_key}: ||p")"
-    case "$install_devices_value" in
-      *'/dev/loop'*|*'/dm-'*|*'dm-name-loop'*) ;;
-      *) continue ;;
-    esac
-    printf '%s %s multiselect /dev/loop0\n' \
-      "${install_devices_key%%/*}" "$install_devices_key" | debconf-set-selections
-  done < <(sed -n 's/^Name: \(grub[^ ]*\/install_devices\)$/\1/p' \
-    /var/cache/debconf/config.dat 2>/dev/null | sort -u)
-  # config.dat-old is debconf's backup of the pre-write database and still holds the
-  # build-varying loop device. debconf recreates it on the deployed system's next
-  # database write, so deleting it here is safe and removes the build-varying bytes.
-  # Delete it AFTER the debconf-set-selections writes above, which would otherwise
-  # recreate it from the not-yet-canonicalized database.
-  rm -f /var/cache/debconf/config.dat-old
 
   # logs
   rm -f /var/log/alternatives.log /var/log/dpkg.log /var/log/apt/history.log \
@@ -1110,7 +1015,7 @@ trap signal_handler HUP INT QUIT TERM
      default_locales timezone fstab install_fs_tools hostname \
      initrd grub_install passwords \
      custom_scripts upgrade_system rpi_cmdline remove_apt_cache services \
-     remove_chrootmirror restore_snapshot_mirror reproducible_finalize; do
+     remove_chrootmirror reproducible_finalize; do
      if stage "$i" ; then
        "$i"
        stage "$i" 'done'
