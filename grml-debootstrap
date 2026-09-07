@@ -42,6 +42,17 @@ else
 fi
 VERSION="${VERSION:-unknown}"
 MNTPOINT="/mnt/debootstrap.$$"
+HAS_FWBOOT_PART='no'
+
+# used for reproducible builds
+(( ID_DERIVE_IDX = 0x7fffffffffffffff ))
+FWBOOT_REIMAGE_TREE=''
+ROOTFS_REIMAGE_TREE=''
+RANDOM_HEX_BYTES_LIST=()
+RANDOM_HEX_BYTE_IDX=0
+FINAL_MIRROR=''
+FINAL_SECURITY_MIRROR=''
+SOURCE_DATE_EPOCH_PRETTY=''
 
 # defaults
 [ -n "$CHROOT_SCRIPTS" ] || CHROOT_SCRIPTS='yes'
@@ -50,10 +61,14 @@ MNTPOINT="/mnt/debootstrap.$$"
 [ -n "$DEBIAN_FRONTEND" ] || DEBIAN_FRONTEND='noninteractive'
 [ -n "$DEFAULT_LANGUAGE" ] || DEFAULT_LANGUAGE='en_US:en'
 [ -n "$DEFAULT_LOCALES" ] || DEFAULT_LOCALES='en_US.UTF-8'
-[ -n "$DISK_IDENTIFIER" ] || DISK_IDENTIFIER='26ada0c0-1165-4098-884d-aafd2220c2c6'
+[ -n "$FS_IDENTIFIER" ] || FS_IDENTIFIER='00000000-0000-0000-0000-000000000000'
+[ -n "$FS_HASH_SEED" ] || FS_HASH_SEED='00000000-0000-0000-0000-000000000000'
+[ -n "$GPT_IDENTIFIER_PREFIX" ] || GPT_IDENTIFIER_PREFIX='00000000-0000-0000-0000'
+[ -n "$MBR_IDENTIFIER" ] || MBR_IDENTIFIER='0x00000000'
+[ -n "$ROOTPASSWORD_SALT" ] || ROOTPASSWORD_SALT='0'
 [ -n "$EXTRAPACKAGES" ] || EXTRAPACKAGES='yes'
 [ -n "$FALLBACK_MIRROR" ] || FALLBACK_MIRROR='http://deb.debian.org/debian'
-[ -n "$FIXED_DISK_IDENTIFIERS" ] || FIXED_DISK_IDENTIFIERS="no"
+[ -n "$FALLBACK_SECURITY_MIRROR" ] || FALLBACK_SECURITY_MIRROR='http://security.debian.org/debian-security'
 [ -n "$FORCE" ] || FORCE=''
 [ -n "$HOSTNAME" ] || HOSTNAME='grml'
 [ -n "$INITRD" ] || INITRD='yes'
@@ -62,6 +77,8 @@ MNTPOINT="/mnt/debootstrap.$$"
 [ -n "$INSTALL_NOTES" ] || INSTALL_NOTES='/etc/debootstrap/install_notes'
 [ -n "$LOCALES" ] || LOCALES='yes'
 [ -n "$MIRROR" ] || MIRROR="$FALLBACK_MIRROR"
+[ -n "$SECURITY_MIRROR" ] || SECURITY_MIRROR="$FALLBACK_SECURITY_MIRROR"
+[ -n "$SNAPSHOT_ARCHIVE" ] || SNAPSHOT_ARCHIVE='https://snapshot.debian.org/archive'
 [ -n "$MKFS" ] || MKFS='mkfs.ext4'
 [ -n "$MKFS_OPTS" ] || MKFS_OPTS=''
 [ -n "$PACKAGES" ] || PACKAGES='yes'
@@ -75,7 +92,6 @@ MNTPOINT="/mnt/debootstrap.$$"
 [ -n "$TIMEZONE" ] || TIMEZONE='Europe/Vienna'
 [ -n "$TUNE2FS" ] || TUNE2FS='tune2fs -c0 -i0'
 [ -n "$UPGRADE_SYSTEM" ] || UPGRADE_SYSTEM='yes'
-[ -n "$VMSIZE" ] || VMSIZE="2G"
 [ -n "$GRUB_INSTALL" ] || GRUB_INSTALL='yes'
 
 # make sure interactive mode is only executed when
@@ -92,7 +108,7 @@ Usage: $PN [options]
 Bootstrap options:
 
   -m, --mirror <URL>     Mirror which should be used for apt-get/aptitude.
-  -r, --release <name>   Release of new Debian system (default: bullseye).
+  -r, --release <name>   Release of new Debian system
   -t, --target <target>  Target partition (/dev/...) or directory where the
                          system should be installed to.
   -p, --mntpoint <mnt>   Mountpoint used for mounting the target system,
@@ -102,10 +118,19 @@ Bootstrap options:
       --nodebootstrap    Skip debootstrap, only do configuration to the target.
       --grub <device>    Target for grub installation. Usage example: /dev/sda
       --efi <device>     Target for EFI installation. Usage example: /dev/sda1
+      --rpifirm <device> Target for Raspberry Pi firmware installation. Usage
+                         example: /dev/mmcblk0p1
       --arch <arch>      Set target architecture.
       --filesystem <fs>  Filesystem that should be used when target is a partition
                          or Virtual Machine (see --vmfile).
       --force            Do not prompt for user acknowledgement.
+
+Options for image file deployments:
+
+      --imagesize        Use specified size for size of image file (default:
+                         2G for BIOS and UEFI systems, 3G for Raspberry Pi
+                         images). Syntax as supported by qemu-img, like:
+                         --imagesize 3G
 
 Options for Virtual Machine deployment:
 
@@ -116,9 +141,17 @@ Options for Virtual Machine deployment:
       --vmfile           Like --vm, but install into a regular file (created by
                          'qemu-img create -f raw ...') instead.
                          Example: --vmfile --target /mnt/sda1/qemu.img
-      --vmsize <size>    Use specified size for size of VM file (default: 2G).
-                         Syntax as supported by qemu-img, like: --vmsize 3G
+      --vmsize <size>    Deprecated alias for --imagesize.
       --vmefi            Create an EFI boot partition for the VM.
+
+Options for Raspberry Pi deployment:
+
+      --rpi              Set up a Raspberry Pi image on an existing block device
+                         instead of plainly installing to a partition or directory.
+                         Needs to be combined with --target.
+                         Example: --rpi --target /dev/mapper/your-rpi-disk
+      --rpifile          Like --rpi, but install into a regular file (created by
+                         'qemu-img create -f raw ...') instead.
 
 Configuration options:
 
@@ -152,6 +185,7 @@ Configuration options:
       --pre-scripts <dir>  Execute scripts from specified directory (before chroot-scripts).
       --scripts <dir>      Execute scripts from specified directory (after chroot-scripts).
       --remove-configs     Delete grml-debootstrap configuration files from installed system.
+      --no-reimage         Don't reimage filesystems even if doing a reproducible build.
 
 Other options:
 
@@ -235,6 +269,17 @@ check4progs(){
      return 1
   fi
 }
+
+check_mke2fs_version(){
+  local version_output version
+  version_output="$(mkfs.ext4 -V 2>&1)"
+  version="$(head -n1 <<< "${version_output}")"
+  version="$(cut -d' ' -f2 <<< "${version}")"
+  if dpkg --compare-versions "${version}" ge '1.47.1' ; then
+    return 0
+  fi
+  return 1
+}
 # }}}
 
 # unmount mountpoint {{{
@@ -265,6 +310,19 @@ try_umount() {
 
 # helper functions {{{
 cleanup() {
+  # Make sure the reimage tree dir names look like actual temp dir names
+  # before deleting them, so we don't accidentally destroy the user's data
+  # shellcheck disable=SC2076
+  if [ -d "${FWBOOT_REIMAGE_TREE}" ] \
+    && [[ "${FWBOOT_REIMAGE_TREE}" =~ '/tmp.' ]] ; then
+    rm -rf "${FWBOOT_REIMAGE_TREE}"
+  fi
+  # shellcheck disable=SC2076
+  if [ -d "${ROOTFS_REIMAGE_TREE}" ] \
+    && [[ "${ROOTFS_REIMAGE_TREE}" =~ '/tmp.' ]] ; then
+    rm -rf "${ROOTFS_REIMAGE_TREE}"
+  fi
+
   if [ -n "$CHROOT_VARIABLES" ] ; then
     einfo "Removing ${CHROOT_VARIABLES}" ; rm "$CHROOT_VARIABLES" || eend $?
   fi
@@ -358,6 +416,181 @@ stage() {
      return 1
   fi
 }
+
+# inverse-decrements ID_DERIVE_IDX, then xor's it with SOURCE_DATE_EPOCH to
+# get a seed number for generating reproducible pseudorandom IDs
+get_seed_from_sde() {
+  local mask seed_target
+
+  seed_target="${1:-}"
+
+  (( mask = 0x4000000000000000 ))
+
+  while [ "${mask}" -gt 0 ] && ! (( ID_DERIVE_IDX & mask )) ; do
+    (( ID_DERIVE_IDX |= mask ))
+    (( mask = mask >> 1 ))
+  done
+  (( ID_DERIVE_IDX &= (mask ^ 0x7fffffffffffffff) ))
+
+  printf -v "${seed_target}" '%s' "$(( SOURCE_DATE_EPOCH ^ ID_DERIVE_IDX ))"
+}
+
+# given a seed and byte count, generates a list of pseudrandom hexadecimal
+# bytes
+gen_random_hex_bytes() {
+  local seed count
+
+  # Bash's $RANDOM can be seeded with any integer Bash considers valid, but it
+  # truncates values and wraps around very quickly. We therefore use Perl
+  # to generate random bytes instead.
+
+  seed="${1:-}"
+  count="${2:-}"
+  if [ -z "${seed}" ] || ! [[ "${seed}" =~ ^[0-9]+$ ]]; then
+    eerror "No seed or invalid seed given to gen_random_hex_bytes!"
+    bailout 1
+  fi
+  if [ -z "${count}" ] || ! [[ "${count}" =~ ^[0-9]+$ ]]; then
+    eerror "No count or invalid count given to gen_random_hex_bytes!"
+    bailout 1
+  fi
+
+  readarray -t RANDOM_HEX_BYTES_LIST < <(python3 -c \
+    'import sys, random; r = random.Random(int(sys.argv[1])); bytes = r.randbytes(int(sys.argv[2])); print(bytes.hex("\n"))' \
+    "${seed}" "${count}")
+  RANDOM_HEX_BYTE_IDX=0
+}
+
+# gets the next random hex value from RANDOM_HEX_BYTES_LIST
+get_random_hex_byte() {
+  if [ -z "${1:-}" ]; then
+    eerror 'No target var name provided to get_random_hex_byte!'
+    bailout 1
+  fi
+  if [ "${RANDOM_HEX_BYTE_IDX}" -ge "${#RANDOM_HEX_BYTES_LIST[@]}" ]; then
+    eerror 'Out of random hex bytes!'
+    bailout 1
+  fi
+  printf -v "${1:-}" '%s' "${RANDOM_HEX_BYTES_LIST[RANDOM_HEX_BYTE_IDX]}"
+  (( RANDOM_HEX_BYTE_IDX += 1 )) || true
+}
+
+# creates an MBR disk identifier from SOURCE_DATE_EPOCH
+mbr_id_from_sde() {
+  local target_var_name mbr_id_str rand_byte idx_a seed
+
+  target_var_name="${1:-}"
+
+  if [ -z "${target_var_name}" ]; then
+    eerror 'No target var name provided to mbr_id_from_seed!'
+    bailout 1
+  fi
+
+  get_seed_from_sde seed
+  gen_random_hex_bytes "${seed}" 4
+  mbr_id_str='0x'
+
+  for idx_a in {1..4}; do
+    get_random_hex_byte rand_byte
+    mbr_id_str+="${rand_byte}"
+  done
+
+  printf -v "${target_var_name}" '%s' "${mbr_id_str}"
+}
+
+# creates a UUID or UUID prefix from SOURCE_DATE_EPOCH
+uuid_from_sde() {
+  local component_count target_var_name uuid_str rand_byte idx_a idx_b seed
+
+  component_count="${1:-}"
+  target_var_name="${2:-}"
+
+  if [ -z "${component_count}" ] \
+    || ! [[ "${component_count}" =~ ^[0-9]+$ ]] \
+    || [ "${component_count}" -gt 5 ] \
+    || [ "${component_count}" -lt 1 ]; then
+    eerror 'No (or invalid) component count provided to uuid_from_seed!'
+    bailout 1
+  fi
+  if [ -z "${target_var_name}" ]; then
+    eerror 'No target var name provided to uuid_from_seed!'
+    bailout 1
+  fi
+
+  get_seed_from_sde seed
+  gen_random_hex_bytes "${seed}" 16
+  uuid_str=''
+
+  for idx_a in {1..4}; do
+    get_random_hex_byte rand_byte
+    uuid_str+="${rand_byte}"
+  done
+
+  for (( idx_a = 1; idx_a < component_count; idx_a++ )); do
+    uuid_str+='-'
+    # shellcheck disable=SC2034
+    for idx_b in {1..2}; do
+      get_random_hex_byte rand_byte
+      uuid_str+="${rand_byte}"
+    done
+    [ "${idx_a}" -ge 3 ] && break;
+  done
+
+  if [ "${component_count}" -ge 5 ]; then
+    uuid_str+='-'
+    for idx_a in {1..6}; do
+      get_random_hex_byte rand_byte
+      uuid_str+="${rand_byte}"
+    done
+  fi
+
+  printf -v "${target_var_name}" '%s' "${uuid_str}"
+}
+
+# insecurely creates a yescrypt-compatible password salt from
+# SOURCE_DATE_EPOCH
+insecure_password_salt_from_sde() {
+  local target_var_name salt_str hex_str rand_byte rand_val base64_digits \
+    gen_idx gen_sub_idx seed
+
+  target_var_name="${1:-}"
+
+  if [ -z "${target_var_name}" ]; then
+    eerror 'No target var name provided to insecure_password_salt_from_sde!'
+    bailout 1
+  fi
+
+  get_seed_from_sde seed
+  gen_random_hex_bytes "${seed}" 24
+  salt_str=''
+  rand_byte=''
+  rand_val=''
+  base64_digits='./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+
+  # yescrypt's salt is in base 64, each digit carries 6 bits of information.
+  # get_random_hex_byte returns 8 bits of information per call, so we generate
+  # data 24 bits at a time, bulting up a 192-bit salt. yescrypt supports
+  # between 128 bit and 512 bit salts. The actual strength of this salt is
+  # 63 bits **at best** since we derive it from a 63-bit timestamp, and
+  # because it's derived from a timestamp, it's safe to assume this is as
+  # secure as no salt at all. In practice though, this might be marginally
+  # more secure than no salt.
+
+  for (( gen_idx = 0; gen_idx < 8; gen_idx++ )); do
+    hex_str=''
+    for (( gen_sub_idx = 0; gen_sub_idx < 3; gen_sub_idx++ )); do
+      get_random_hex_byte rand_byte
+      hex_str+="${rand_byte}"
+    done
+    (( rand_val = "0x${hex_str}" )) || true # converts hex to decimal
+    for (( gen_sub_idx = 0; gen_sub_idx < 4; gen_sub_idx++ )); do
+      salt_str+="${base64_digits:$((rand_val % 64)):1}"
+      (( rand_val /= 64 )) || true
+    done
+  done
+
+  printf -v "${target_var_name}" '%s' "${salt_str}"
+}
 # }}}
 
 # source main configuration file {{{
@@ -369,7 +602,7 @@ fi
 # }}}
 
 # cmdline handling {{{
-CMDLINE_OPTS=mirror:,iso:,release:,target:,mntpoint:,debopt:,defaultinterfaces,interactive,nodebootstrap,nointerfaces,nokernel,nopackages,filesystem:,config:,confdir:,packages:,chroot-scripts:,scripts:,post-scripts:,pre-scripts:,debconf:,vm,vmfile,vmsize:,vmefi,keep_src_list,hostname:,password:,nopassword,grmlrepos,backportrepos,bootappend:,grub:,efi:,arch:,insecure,verbose,help,version,force,debug,contrib,non-free,remove-configs,sshcopyid,sshcopyauth
+CMDLINE_OPTS=mirror:,iso:,release:,target:,mntpoint:,debopt:,defaultinterfaces,interactive,nodebootstrap,nointerfaces,nokernel,nopackages,filesystem:,config:,confdir:,packages:,chroot-scripts:,scripts:,post-scripts:,pre-scripts:,debconf:,vm,vmfile,vmsize:,imagesize:,vmefi,rpi,rpifile,keep_src_list,hostname:,password:,nopassword,grmlrepos,backportrepos,bootappend:,grub:,efi:,rpifirm:,arch:,insecure,verbose,help,version,force,debug,contrib,non-free,remove-configs,sshcopyid,sshcopyauth
 
 if ! _opt_temp=$(getopt --name grml-debootstrap -o +m:i:r:t:p:c:d:vhV --long \
   $CMDLINE_OPTS -- "$@"); then
@@ -391,6 +624,9 @@ while :; do
   --target|-t)         # Target partition (/dev/...) or directory
     shift; _opt_target="$1"
     ;;
+  --imagesize)         # size of image deployment file
+    shift; _opt_imagesize="$1"
+    ;;
   --vm)                # Virtual machine image (no file)
     _opt_vm="T"
     ;;
@@ -398,10 +634,16 @@ while :; do
     _opt_vmfile="T"
     ;;
   --vmsize)            # size of Virtual machine file
-    shift; _opt_vmsize="$1"
+    shift; _opt_imagesize="$1"
     ;;
   --vmefi)            # Create an EFI boot partition for the VM
     _opt_vmefi="T"
+    ;;
+  --rpi)               # RPi image (no file)
+    _opt_rpi="T"
+    ;;
+  --rpifile)           # RPi image file
+    _opt_rpifile="T"
     ;;
   --mntpoint|-p)       # Mountpoint used for mounting the target system
     shift; _opt_mntpoint="$1"
@@ -461,7 +703,7 @@ while :; do
     shift; _opt_chroot_scripts="$1"
     _opt_chroot_scripts_set=T
     ;;
-  --keep_src_list)     # Do not overwrite user provided apt sources
+  --keep_src_list)     # Do not override user provided apt sources
     _opt_keep_src_list=T
     ;;
   --hostname)          # Hostname of Debian system
@@ -503,6 +745,9 @@ while :; do
   --efi)               # Target for EFI boot installation
     shift; _opt_efi="$1"
     ;;
+  --rpifirm)           # Target for RPi firmware installation
+    shift; _opt_rpifirm="$1"
+    ;;
   --contrib)           # Add 'contrib' to list of components
     _opt_contrib=T
     ;;
@@ -512,11 +757,14 @@ while :; do
   --remove-configs)    # Drop config files from installed system
     _opt_remove_configs=T
     ;;
+  --no-reimage)        # Skip reimaging the filesystems for reproducible builds
+    _opt_no_reimage=T
+    ;;
 
   # == Other options
   --verbose|-v)        # Increase verbosity
     if [ "$_opt_verbose" ]; then
-      _opt_verbose=$( _opt_verbose + 1 )
+      _opt_verbose=$(( _opt_verbose + 1 ))
     else
       _opt_verbose=1
     fi
@@ -565,9 +813,11 @@ done
 [ "$_opt_release" ]             && RELEASE=$_opt_release
 [ "$_opt_target" ]              && TARGET=$_opt_target
 [ "$_opt_vm" ]                  && VIRTUAL=1
-[ "$_opt_vmfile" ]              && VMFILE=1 && VIRTUAL=1
-[ "$_opt_vmsize" ]              && VMSIZE=$_opt_vmsize
+[ "$_opt_vmfile" ]              && IMAGEFILE=1 && VIRTUAL=1
+[ "$_opt_imagesize" ]           && IMAGESIZE=$_opt_imagesize
 [ "$_opt_vmefi" ]               && VMEFI=1
+[ "$_opt_rpi" ]                 && RPI=1
+[ "$_opt_rpifile" ]             && IMAGEFILE=1 && RPI=1
 [ "$_opt_mntpoint" ]            && MNTPOINT=$_opt_mntpoint
 [ "$_opt_debopt" ]              && DEBOOTSTRAP_OPT=$_opt_debopt
 [ "$_opt_interactive" ]         && INTERACTIVE=1
@@ -593,25 +843,48 @@ done
 [ "$_opt_bootappend" ]          && BOOT_APPEND=$_opt_bootappend
 [ "$_opt_grub" ]                && GRUB=$_opt_grub
 [ "$_opt_efi" ]                 && EFI=$_opt_efi
+[ "$_opt_rpifirm" ]             && RPIFIRM=$_opt_rpifirm && RPI=1
 [ "$_opt_arch" ]                && ARCH=$_opt_arch
 [ "$_opt_insecure" ]            && echo "Warning: --insecure is deprecated, continuing anyway."
 [ "$_opt_force" ]               && FORCE=$_opt_force
 [ "$_opt_verbose" ]             && VERBOSE="true"
 [ "$_opt_debug" ]               && DEBUG="true"
 [ "$_opt_remove_configs" ]      && REMOVE_CONFIGS="yes"
+[ "$_opt_no_reimage" ]          && NO_REIMAGE="yes"
 
 # make sure main is always included
 [ -z "$COMPONENTS" ]            && COMPONENTS="main"
 [ "$_opt_contrib" ]             && COMPONENTS="$COMPONENTS contrib"
+[ "$_opt_non_free" ]            && COMPONENTS="$COMPONENTS non-free-firmware non-free"
 
-case "${RELEASE}" in
-  bullseye)
-    [ "$_opt_non_free" ] && COMPONENTS="$COMPONENTS non-free"
-    ;;
-  *)
-    [ "$_opt_non_free" ] && COMPONENTS="$COMPONENTS non-free-firmware non-free"
-    ;;
-esac
+# If $VMSIZE is set and $IMAGESIZE is unset, put $VMSIZE's value in $IMAGESIZE.
+#
+# If $VMSIZE is unset and $IMAGESIZE is set, keep $IMAGESIZE's value.
+#
+# If $VMSIZE is unset and $IMAGESIZE is unset, $IMAGESIZE defaults to 2G for VM images and 3G for
+# RPi images (which need a bit more space).
+if [ -n "$VMSIZE" ] && [ -z "$IMAGESIZE" ]; then
+  IMAGESIZE="$VMSIZE"
+elif [ -z "$IMAGESIZE" ]; then
+  if [ "$RPI" ]; then
+    IMAGESIZE="3G"
+  else
+    IMAGESIZE="2G"
+  fi
+fi
+
+if [ "$RPI" ] && [ -z "$ARCH" ]; then
+  # Ensure the architecture for the build is set to arm64 even if building on
+  # a non-arm64 machine, this is necessary for cross-builds to work
+  ARCH='arm64'
+fi
+
+# RPi images *require* non-free-firmware as the raspi-firmware package resides
+# there, and Raspberry Pis are not bootable without it.
+if [ -z "$_opt_non_free" ] && [ "$RPI" ]; then
+  eerror "Raspberry Pi images require non-free firmware, please add --non-free to your command line."
+  bailout 1
+fi
 
 # command line option checks
 if [ "$_opt_scripts_set" ] ; then
@@ -641,6 +914,27 @@ if [ "$_opt_efi" ] && [ "$_opt_vmefi" ] ; then
   bailout 1
 fi
 
+if [ "$RPI" ] && [ "$EFI" ] ; then
+  eerror "Raspberry Pi UEFI support has not yet been implemented, please drop EFI-related options from your command line."
+  bailout 1
+fi
+
+if [ "$RPI" ] && [ "$VIRTUAL" ] ; then
+  eerror "Raspberry Pi and virtual machine image options are mutually exclusive, please drop one of them from your command line."
+  eerror "If you want to build a virtual machine image for use on a Raspberry Pi, please build a VM image for the ARM64 architecture."
+  bailout 1
+fi
+
+if [ "$RPI" ] && [ "$GRUB" ] ; then
+  eerror "Raspberry Pi images do not use GRUB, please drop GRUB-related options from your command line."
+  bailout 1
+fi
+
+if [ "$RPI" ] && [ -n "$ARCH" ] && [ "$ARCH" != 'arm64' ] ; then
+  eerror "Raspberry Pi images support only the arm64 architecture. Please drop the --arch option from your command line or change it to specify arm64."
+  bailout 1
+fi
+
 if [ "${_opt_sshcopyid}" ] && [ "${_opt_sshcopyauth}" ] ; then
   eerror "The --sshcopyid option is incompatible with --sshcopyauth, please drop either of them from your command line."
   bailout 1
@@ -664,6 +958,57 @@ fi
   einfo "Report bugs via https://github.com/grml/grml-debootstrap/ or https://grml.org/bugs/"
   exit 0
 }
+
+if [ -v SOURCE_DATE_EPOCH ] ; then
+  if [ -z "${SOURCE_DATE_EPOCH}" ] ; then
+    eerror "SOURCE_DATE_EPOCH is set but empty. Please unset it or set it to a decimal integer."
+    bailout 1
+  fi
+  if ! [[ "${SOURCE_DATE_EPOCH}" =~ ^[1-9][0-9]*$ ]] ; then
+    eerror "SOURCE_DATE_EPOCH is set to '${SOURCE_DATE_EPOCH}' but is not a decimal integer. Please unset it or set it to a decimal integer."
+    bailout 1
+  fi
+  # Bash only supports 64-bit signed integers; if SOURCE_DATE_EPOCH is greater
+  # than INT64_MAX, it will wrap around and become negative (or if it's so big
+  # that it becomes positive again, it will be longer than 19 digits).
+  if [ "${#SOURCE_DATE_EPOCH}" -gt 19 ] || (( SOURCE_DATE_EPOCH < 0 )) ; then
+    eerror "SOURCE_DATE_EPOCH is larger than INT64_MAX. Please unset it or set it to a smaller decimal integer."
+    bailout 1
+  fi
+  if [ "${SOURCE_DATE_EPOCH}" -gt "$(date +%s)" ]; then
+    eerror "SOURCE_DATE_EPOCH is in the future, which prevents downloading reproducible packages. Please set it to an earlier time."
+    bailout 1
+  fi
+  if [ "${MKFS}" != 'mkfs.ext4' ] ; then
+    eerror "SOURCE_DATE_EPOCH is set, but MKFS is not mkfs.ext4. Reproducible builds are only supported when using ext4."
+    bailout 1
+  fi
+  if [ "${USE_DEFAULT_INTERFACES}" != 'true' ]; then
+    eerror "SOURCE_DATE_EPOCH is set, but --defaultinterfaces was not passed! The resulting image would not be reproducible. Please add --defaultinterfaces to your command line."
+    bailout 1
+  fi
+  if [ "$HOSTNAME" = "$(hostname)" ]; then
+    ewarn "Attempting a reproducible build, but the image hostname is the same as the build host's. The image may not be reproducible."
+  fi
+
+  SOURCE_DATE_EPOCH_PRETTY="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}" \
+    '+%Y%m%dT%H%M%SZ')"
+
+  # Probably unnecessary, but just in case...
+  export SOURCE_DATE_EPOCH
+
+  uuid_from_sde 5 FS_IDENTIFIER
+  uuid_from_sde 5 FS_HASH_SEED
+  uuid_from_sde 4 GPT_IDENTIFIER_PREFIX
+  mbr_id_from_sde MBR_IDENTIFIER
+  if [ "${ROOTPASSWORD_SALT}" = '0' ] ; then
+    ewarn "Reproducible builds are enabled but ROOTPASSWORD_SALT is not set! This may be a security risk!"
+    insecure_password_salt_from_sde ROOTPASSWORD_SALT
+  elif ! [[ "${ROOTPASSWORD_SALT}" =~ ^[./A-Za-z0-9]{1,86}$ ]]; then
+    eerror "The value of ROOTPASSWORD_SALT is invalid!"
+    bailout 1
+  fi
+fi
 # }}}
 
 # check for root permissions {{{
@@ -678,6 +1023,14 @@ check4progs mmdebstrap || bailout 1
 
 if [ -n "$VIRTUAL" ] ; then
   check4progs kpartx parted qemu-img || bailout 1
+fi
+
+if [ -v SOURCE_DATE_EPOCH ] ; then
+  check4progs python3 mcopy mdir || bailout 1
+  if ! check_mke2fs_version; then
+    eerror "Reproducible builds require e2fsprogs >= 1.47.1!"
+    bailout 1
+  fi
 fi
 # }}}
 
@@ -718,10 +1071,8 @@ Do you want to continue installing Debian using this frontend?" 0 0 || bailout 0
 # ask for target {{{
 prompt_for_target()
 {
-  AVAILABLE_PARTITIONS=$(LC_ALL=C fdisk -l 2>/dev/null | \
-               sed 's/*//' | \
-               grep -v 'Extended$' | \
-               gawk -v num=0 -v ORS=' ' '/^\/dev\// {print $1}'; ls /dev/md[0-9]* 2>/dev/null || true);
+  AVAILABLE_PARTITIONS=$(lsblk -pPno name,type | \
+    awk -F '"' '($4=="part" || $4~/raid/) {print $2}' | sort -u);
 
   if [ -z "$AVAILABLE_PARTITIONS" ] ; then
      dialog --title "$PN" --trim \
@@ -819,11 +1170,11 @@ prompt_for_release()
   local default_value="$RELEASE"
   RELEASE="$(dialog --stdout --title "${PN}" --default-item "$default_value" --menu \
             "Please enter the Debian release you would like to use for installation:" \
-            0 50 0 \
-            bullseye Debian/11 \
-            bookworm Debian/12 \
-            trixie   Debian/13 \
-            sid      Debian/unstable)" \
+            16 50 5 \
+            bookworm "Debian/12" \
+            trixie   "Debian/13" \
+            forky    "Debian/14 UNRELEASED" \
+            sid      "Debian/unstable")" \
             || bailout
 }
 # }}}
@@ -894,10 +1245,8 @@ TARGET=$(dialog --stdout --title "$PN" --default-item /dev/md0 \
 Notice: activated devices will not be listed for security reasons. Anyway, please make sure the selected device is not in use already!" 0 0 0 \
 $MD_LIST) || bailout 20
 
-AVAILABLE_PARTITIONS=$(LC_ALL=C fdisk -l 2>/dev/null | \
-             sed 's/*//' | \
-             grep -v 'Extended$' | \
-             gawk -v num=0 -v ORS=' ' '/^\/dev\// {print $1}')
+AVAILABLE_PARTITIONS=$(lsblk -pPno name,type | \
+  awk -F '"' '$4=="part" {print $2}' | sort -u)
 [ -n "$AVAILABLE_PARTITIONS" ] || echo "Fatal error: no partitions available?"
 PARTITION_LIST=$(for i in $AVAILABLE_PARTITIONS ; do
                      echo "$i $(blkid -s TYPE -o value "$i" 2>/dev/null || echo '[no_filesystem_yet]') off"
@@ -950,26 +1299,29 @@ fi
 }
 # }}}
 
-# format efi partition {{{
-format_efi_partition() {
-  if [ -z "$EFI" ] ; then
-    return 0
-  fi
-
-  if ! [ -b "$EFI" ] ; then
-    eerror "Specified efi argument [$EFI] not a valid block device."
-    bailout 1
-  fi
-
-  if fsck.vfat -bn "$EFI" >/dev/null; then
-    einfo "EFI partition $EFI seems to have a FAT filesystem, not modifying."
-  else
-    einfo "EFI partition $EFI doesn't seem to be formatted, creating filesystem."
-    if ! mkfs.fat -F32 -n "EFI" "$EFI" ; then
-      eerror "Error while creating filesystem on ${EFI}."
+# format firmware boot partitions (ESP, Raspberry Pi firmware) {{{
+format_fwboot_partitions() {
+  for fwboot in "EFI $EFI" "RPIFIRM $RPIFIRM"; do
+    fwboot_type="${fwboot% *}"
+    fwboot_part="${fwboot#* }"
+    if [ -z "$fwboot_part" ]; then
+      continue
+    fi
+    if ! [ -b "$fwboot_part" ]; then
+      eerror "$fwboot_type partition $fwboot_part is not a valid block device."
       bailout 1
     fi
-  fi
+
+    if fsck.vfat -bn "$fwboot_part" >/dev/null; then
+      einfo "$fwboot_type partition $fwboot_part seems to have a FAT filesystem, not modifying."
+    else
+      einfo "$fwboot_type partition $fwboot_part doesn't seem to be formatted, creating filesystem."
+      if ! mkfs.fat -F32 -n "$fwboot_type" "$fwboot_part" ; then
+        eerror "Error while creating filesystem on ${fwboot_part}."
+        bailout 1
+      fi
+    fi
+  done
 }
 # }}}
 
@@ -1007,21 +1359,34 @@ if [ -n "$INTERACTIVE" ] ; then
    INFOTEXT="Please recheck configuration before execution:
    "
    [ -n "$TARGET" ]  && INFOTEXT="$INFOTEXT
-   Target:          $TARGET"
+   Target:                $TARGET"
    [ -n "$GRUB" ]    && INFOTEXT="$INFOTEXT
-   Install grub:    $GRUB"
+   Install grub:          $GRUB"
    [ -n "$EFI" ]    && INFOTEXT="$INFOTEXT
-   Install efi:     $EFI"
+   Install efi:           $EFI"
    [ -n "$RELEASE" ] && INFOTEXT="$INFOTEXT
-   Using release:   $RELEASE"
+   Using release:         $RELEASE"
    [ -n "$HOSTNAME" ] && INFOTEXT="$INFOTEXT
-   Using hostname:  $HOSTNAME"
+   Using hostname:        $HOSTNAME"
    [ -n "$MIRROR" ]  && INFOTEXT="$INFOTEXT
-   Using mirror:    $MIRROR"
+   Using mirror:          $MIRROR"
+   [ -n "$SECURITY_MIRROR" ]  && INFOTEXT="$INFOTEXT
+   Using security mirror: $SECURITY_MIRROR"
    [ -n "$ARCH" ]  && INFOTEXT="$INFOTEXT
-   Using arch:      $ARCH"
+   Using arch:            $ARCH"
    [ -n "$CONFFILES" ] && INFOTEXT="$INFOTEXT
-   Config files:    $CONFFILES"
+   Config files:          $CONFFILES"
+   if [ -v SOURCE_DATE_EPOCH ]; then
+     INFOTEXT="$INFOTEXT
+   Reproducible build:    yes"
+     INFOTEXT="$INFOTEXT
+   Final mirror:          ${FINAL_MIRROR:-${MIRROR}}"
+     INFOTEXT="$INFOTEXT
+   Final security mirror: ${FINAL_SECURITY_MIRROR:-${SECURITY_MIRROR}}"
+   else
+     INFOTEXT="$INFOTEXT
+   Reproducible build:    no"
+   fi
 
    INFOTEXT="$INFOTEXT
 
@@ -1036,25 +1401,38 @@ else # if not running automatic installation display configuration and prompt fo
    echo "   Target:          $TARGET"
 
    # do not display if MNTPOINT is the default one
-   case "$MNTPOINT" in /mnt/debootstrap*) ;; *) echo "   Mount point:     $MNTPOINT" ;; esac
+   case "$MNTPOINT" in
+     /mnt/debootstrap*) ;;
+     *)                   echo "   Mount point:           $MNTPOINT" ;;
+   esac
 
    if [ -n "$VIRTUAL" ] && [ "$GRUB_INSTALL" = 'yes' ] ; then
-      echo "   Install grub:    yes"
-      [ -n "$VMEFI" ]   && echo "   Install efi:     yes"   || echo "   Install efi:     no"
+                          echo "   Install grub:          yes"
+      [ -n "$VMEFI" ]  && echo "   Install efi:           yes"   \
+                       || echo "   Install efi:           no"
    else
-     [ -n "$GRUB" ]     && echo "   Install grub:    $GRUB" || echo "   Install grub:    no"
-     [ -n "$EFI" ]      && echo "   Install efi:     $EFI"  || echo "   Install efi:     no"
+     [ -n "$GRUB" ]    && echo "   Install grub:          $GRUB" \
+                       || echo "   Install grub:          no"
+     [ -n "$EFI" ]     && echo "   Install efi:           $EFI"  \
+                       || echo "   Install efi:           no"
    fi
 
-   [ -n "$RELEASE" ]   && echo "   Using release:   $RELEASE"
-   [ -n "$HOSTNAME" ]  && echo "   Using hostname:  $HOSTNAME"
-   [ -n "$MIRROR" ]    && echo "   Using mirror:    $MIRROR"
-   [ -n "$ARCH" ]      && echo "   Using arch:      $ARCH"
-   [ -n "$CONFFILES" ] && echo "   Config files:    $CONFFILES"
+   [ -n "$RELEASE" ]   && echo "   Using release:         $RELEASE"
+   [ -n "$HOSTNAME" ]  && echo "   Using hostname:        $HOSTNAME"
+   [ -n "$MIRROR" ]    && echo "   Using mirror:          $MIRROR"
+   [ -n "$ARCH" ]      && echo "   Using arch:            $ARCH"
+   [ -n "$CONFFILES" ] && echo "   Config files:          $CONFFILES"
+   if [ -v SOURCE_DATE_EPOCH ]; then
+                          echo "   Reproducible build:    yes"
+                          echo "   Final mirror:          ${FINAL_MIRROR:-${MIRROR}}"
+                          echo "   Final security mirror: ${FINAL_SECURITY_MIRROR:-${SECURITY_MIRROR}}"
+   else
+                          echo "   Reproducible build:    no"
+   fi
    if [ -n "$VIRTUAL" ] ; then
       echo "   Deploying as Virtual Machine."
-      if [ -n "$VMSIZE" ] && [ -n "$VMFILE" ]; then
-         echo "   Using Virtual Disk file with size of ${VMSIZE}."
+      if [ -n "$IMAGESIZE" ] && [ -n "$IMAGEFILE" ]; then
+         echo "   Using Virtual Disk file with size of ${IMAGESIZE}."
       fi
    fi
 
@@ -1073,7 +1451,7 @@ else # if not running automatic installation display configuration and prompt fo
      echo
      einfon "Is this ok for you? [y/N] "
      read -r a
-     if ! [ "$a" = 'y' ] || [ "$a" = 'Y' ] ; then
+     if [ "$a" != 'y' ] && [ "$a" != 'Y' ] ; then
         eerror "Exiting as requested."
         bailout 1
      fi
@@ -1136,6 +1514,16 @@ if [[ "$ARCH" != "amd64" ]] && [[ "$ARCH" != "arm64" ]] ; then
 fi
 # }}}
 
+# Detect if a firmware boot partition is going to exist (for reproducible builds). {{{
+if [ -n "${EFI}" ] \
+  || [ "${VMEFI}" = '1' ] \
+  || [ -n "${RPIFIRM}" ] \
+  || [ "${RPI}" = '1' ] \
+  || [ "${ARCH}" = 'arm64' ] ; then
+  HAS_FWBOOT_PART='yes'
+fi
+# }}}
+
 # Support for generic release codenames is unavailable. {{{
 if [ "$RELEASE" = "stable" ] || [ "$RELEASE" = "testing" ] ; then
    eerror "Generic release codenames (stable, testing) are unsupported. \
@@ -1144,10 +1532,23 @@ Please use specific codenames such as bookworm or trixie."
 fi
 # }}}
 
-# Verify that provided GRUB device actually exists{{{
+# Verify that provided GRUB device actually exists {{{
 if [ -n "${GRUB}" ] && ! [ -b "${GRUB}" ] ;  then
   eerror "GRUB target '${GRUB}' doesn't look like a supported block device."
   bailout 1
+fi
+# }}}
+
+# Use snapshot mirrors for reproducible builds {{{
+if [ -v SOURCE_DATE_EPOCH ]; then
+  if ! [[ "${MIRROR}" =~ ^file: ]]; then
+    FINAL_MIRROR="$MIRROR"
+    MIRROR="${SNAPSHOT_ARCHIVE}/debian/${SOURCE_DATE_EPOCH_PRETTY}"
+  fi
+  if ! [[ "${SECURITY_MIRROR}" =~ ^file: ]]; then
+    FINAL_SECURITY_MIRROR="$SECURITY_MIRROR"
+    SECURITY_MIRROR="${SNAPSHOT_ARCHIVE}/debian-security/${SOURCE_DATE_EPOCH_PRETTY}"
+  fi
 fi
 # }}}
 checkconfiguration
@@ -1193,7 +1594,7 @@ set_target_directory(){
     TARGET="$(readlink -f "$TARGET")"
 }
 
-if [ -b "$TARGET" ] || [ -n "$VIRTUAL" ] ; then
+if [ -b "$TARGET" ] || [ -n "$VIRTUAL" ] || [ -n "$RPI" ]; then
     PARTITION=1
 else
     # $TARGET was not detected as block device, but we do not want to create target directory in /dev/
@@ -1229,33 +1630,12 @@ mkfs() {
     esac
   fi
 
-  if [ -n "$MKFS" ] && [ "$MKFS" = "mkfs.ext4" ] ; then
-    # Detect modern mkfs.ext4 features, and disable them if the kernel or fsck
-    # on the target release will be too old to support them.
-    local e2fsprogs_version
-    e2fsprogs_version="$(dpkg-query --show --showformat='${Version}' e2fsprogs 2>/dev/null || echo 1.44)"
-
-    local mkfs_supports_metadata_csum_seed=''
-    if [ -n "$e2fsprogs_version" ] && dpkg --compare-versions "$e2fsprogs_version" ge '1.43' ; then
-      mkfs_supports_metadata_csum_seed=1
-    fi
-    local mkfs_supports_orphan_file=''
-    if [ -n "$e2fsprogs_version" ] && dpkg --compare-versions "$e2fsprogs_version" ge '1.47.0-1' ; then
-      mkfs_supports_orphan_file=1
-    fi
-
-    case "$RELEASE" in
-      bullseye|buster)
-        if [ "$mkfs_supports_metadata_csum_seed" = 1 ]; then
-          einfo "Disabling $MKFS feature as OS Release $RELEASE does not support it: metadata_csum_seed"
-          MKFS_OPTS="$MKFS_OPTS -O ^metadata_csum_seed"
-        fi
-        if [ "$mkfs_supports_orphan_file" = 1 ]; then
-          einfo "Disabling $MKFS feature as OS Release $RELEASE does not support it: orphan_file"
-          MKFS_OPTS="$MKFS_OPTS -O ^orphan_file"
-        fi
-        ;;
-    esac
+  if [ -v SOURCE_DATE_EPOCH ] ; then
+    # MKFS is guaranteed to be mkfs.ext4. reimage_root_filesystem will rebuild
+    # the filesystem we generate here, so we don't technically need to set
+    # these here, but reimage_root_filesystem will reuse MKFS_OPTS and there's
+    # no real reason to not set it here.
+    MKFS_OPTS="$MKFS_OPTS -E hash_seed=${FS_HASH_SEED} -U ${FS_IDENTIFIER}"
   fi
 
   if [ -n "$MKFS" ] ; then
@@ -1263,25 +1643,22 @@ mkfs() {
     # shellcheck disable=SC2086
     "$MKFS" $MKFS_OPTS "$TARGET"
 
-    if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
-      if ! echo "$MKFS" | grep -q "mkfs.ext" ; then
-        eerror "Not changing disk uuid for $TARGET because $MKFS doesn't seem to match for ext{2,3,4} file system"
-        bailout 1
-      else
-        einfo "Changing disk uuid for $TARGET to fixed (non-random) value $DISK_IDENTIFIER using tune2fs"
-        tune2fs "$TARGET" -U "$DISK_IDENTIFIER" </dev/null
-      fi
-    fi
-
     if [ -n "$VIRTUAL" ] && [ -n "$EFI_TARGET" ]; then
       einfo "Creating FAT filesystem on $EFI_TARGET"
       mkfs.fat -F32 -n "EFI" "$EFI_TARGET"
+    fi
+
+    if [ -n "$RPI" ] && [ -n "$RPIFIRM_TARGET" ]; then
+      einfo "Creating FAT filesystem on $RPIFIRM_TARGET"
+      mkfs.fat -F32 -n "RPIFIRM" "$RPIFIRM_TARGET"
     fi
 
     # make sure /dev/disk/by-uuid/... is up2date, otherwise grub
     # will fail to detect the uuid in the chroot
     if [ -n "$VIRTUAL" ] ; then
       einfo "Virtual environment doesn't require blockdev --rereadpt, skipping therefore"
+    elif [ -n "$RPI" ] ; then
+      einfo "Raspberry Pi image build doesn't require blockdev --rereadpt, skipping therefore"
     elif echo "$TARGET" | grep -q "/dev/md" ; then
       blockdev --rereadpt "${TARGET}"
     else
@@ -1393,18 +1770,51 @@ mount_target() {
 }
 # }}}
 
+# adjust disk and partition IDs to be deterministic {{{
+make_disk_ids_deterministic() {
+  einfo "Making disk IDs deterministic"
+  if [ -n "$VMEFI" ]; then
+    local part_number_list part_number gpt_id
+
+    # All of the partition numbers will probably be contiguous, but in theory
+    # there could be holes, so we get the list of partition numbers as
+    # reported by sfdisk instead of simply counting numbers.
+    #
+    # Partition ID lines contain a ' : ' near the beginning of the line. The
+    # space-separated word immediately before this substring has a decimal
+    # partition ID at the end of it.
+
+    readarray -t part_number_list < <(sfdisk -d -- "${TARGET}" \
+      | grep --only-matching '[^ ]\+ : ' | sed -n 's/.*\([0-9]\+\).*/\1/p')
+    sfdisk --disk-id "${TARGET}" "${GPT_IDENTIFIER_PREFIX}-000000000000"
+
+    for part_number in "${part_number_list[@]}"; do
+      printf -v gpt_id "%s-%012d" "${GPT_IDENTIFIER_PREFIX}" "${part_number}"
+      sfdisk --part-uuid "${TARGET}" "${part_number}" "${gpt_id}"
+    done
+
+    # Parted seems to use an MBR disk identifier of 0x00000000 for the
+    # protective MBR, but just in case, change it to match $MBR_IDENTIFIER
+    # anyway.
+    sfdisk --label-nested dos --disk-id "${TARGET}" "${MBR_IDENTIFIER}"
+  else
+    sfdisk --disk-id "${TARGET}" "${MBR_IDENTIFIER}"
+  fi
+}
+# }}}
+
 # prepare VM image for usage with debootstrap {{{
-prepare_vm() {
-  if [ -z "$VIRTUAL" ] ; then
+prepare_image() {
+  if [ -z "$VIRTUAL" ] && [ -z "$RPI" ]; then
      return 0 # be quiet by intention
   fi
 
-  if [ -b "$TARGET" ] && [ -n "$VMFILE" ] ; then
-     eerror "Error: specified virtual disk target ($TARGET) is an existing block device."
+  if [ -b "$TARGET" ] && [ -n "$IMAGEFILE" ] ; then
+     eerror "Error: specified disk image target ($TARGET) is an existing block device."
      bailout 1
   fi
-  if [ ! -b "$TARGET" ] && [ -z "$VMFILE" ] ; then
-     eerror "Error: specified virtual disk target ($TARGET) does not exist yet."
+  if [ ! -b "$TARGET" ] && [ -z "$IMAGEFILE" ] ; then
+     eerror "Error: specified disk image target ($TARGET) does not exist yet."
      bailout 1
   fi
 
@@ -1427,7 +1837,7 @@ prepare_vm() {
 
   case "$ARCH" in
     amd64)      true;;
-    arm64)      VMEFI=1;;
+    arm64)      [ -z "$RPI" ] && VMEFI=1;;
   esac
 
   parted_type_command_supported='no'
@@ -1435,8 +1845,8 @@ prepare_vm() {
     parted_type_command_supported='yes'
   fi
 
-  if [ -n "$VMFILE" ]; then
-    qemu-img create -f raw "${TARGET}" "${VMSIZE}"
+  if [ -n "$IMAGEFILE" ]; then
+    qemu-img create -f raw "${TARGET}" "${IMAGESIZE}"
   fi
   if [ -n "$VMEFI" ]; then
     parted -s "${TARGET}" 'mklabel gpt'
@@ -1461,17 +1871,18 @@ prepare_vm() {
         parted -s "${TARGET}" 'type 3 4f68bce3-e8cd-4db1-96e7-fbcaf984b709'
       fi
     fi
+  elif [ -n "$RPI" ]; then
+    parted -s "${TARGET}" 'mklabel msdos'
+    parted -s "${TARGET}" 'mkpart primary fat32 4MiB 508MiB'
+    parted -s "${TARGET}" 'mkpart primary ext4 508MiB 100%'
   else
     parted -s "${TARGET}" 'mklabel msdos'
-    if [ "$FIXED_DISK_IDENTIFIERS" = "yes" ] ; then
-      einfo "Adjusting disk signature to a fixed (non-random) value"
-      MBRTMPFILE=$(mktemp)
-      dd if="${TARGET}" of="${MBRTMPFILE}" bs=512 count=1
-      echo -en "\\x41\\x41\\x41\\x41" | dd of="${MBRTMPFILE}" conv=notrunc seek=440 bs=1
-      dd if="${MBRTMPFILE}" of="${TARGET}" conv=notrunc
-    fi
     parted -s "${TARGET}" 'mkpart primary ext4 4MiB 100%'
     parted -s "${TARGET}" 'set 1 boot on'
+  fi
+
+  if [ -v SOURCE_DATE_EPOCH ] ; then
+    make_disk_ids_deterministic
   fi
 
   DEVINFO=$(kpartx -asv "$TARGET") # e.g. 'add map loop0p1 (254:5): 0 20477 linear 7:0 3' - will be multi-line for EFI VMs
@@ -1482,16 +1893,29 @@ prepare_vm() {
 
   # hopefully this always works as expected
   LOOP_PART="${DEVINFO##add map }" # 'loop0p1 (254:5): 0 20477 linear 7:0 3'
+
+  case "${LOOP_PART}" in
+    sd*|vd*|xvd*) part_prefix=""  ;;
+    *)            part_prefix="p" ;;
+  esac
+
   LOOP_PART="${LOOP_PART// */}"    # 'loop0p1'
   if [ -n "$VMEFI" ]; then
-    export EFI_TARGET="/dev/mapper/$LOOP_PART" # '/dev/mapper/loop0p1'
+    EFI_TARGET="/dev/mapper/$LOOP_PART" # '/dev/mapper/loop0p1'
     if [ "$ARCH" = 'arm64' ]; then
-      LOOP_PART="${LOOP_PART%p1}p2"
+      LOOP_PART="${LOOP_PART%"${part_prefix}"1}${part_prefix}2"
     else
-      LOOP_PART="${LOOP_PART%p1}p3"
+      LOOP_PART="${LOOP_PART%"${part_prefix}"1}${part_prefix}3"
     fi
+  elif [ -n "$RPI" ]; then
+    RPIFIRM_TARGET="/dev/mapper/$LOOP_PART" # '/dev/mapper/loop0p1'
+    LOOP_PART="${LOOP_PART%"${part_prefix}"1}${part_prefix}2"
   fi
-  LOOP_DISK="${LOOP_PART%p*}"      # 'loop0'
+  if [ -n "${part_prefix}" ]; then
+    LOOP_DISK="${LOOP_PART%"${part_prefix}"*}"      # 'loop0'
+  else
+    LOOP_DISK="${LOOP_PART%%[0-9]*}"              # 'sda'
+  fi
   export TARGET="/dev/mapper/$LOOP_PART" # '/dev/mapper/loop0p1'
 
   if [ -z "$TARGET" ] ; then
@@ -1500,29 +1924,147 @@ prepare_vm() {
   fi
 
   if [ -z "$GRUB" ]; then
-    GRUB="/dev/$LOOP_DISK" # '/dev/mapper/loop0'
+    GRUB="/dev/$LOOP_DISK" # '/dev/loop0' or '/dev/sda'
   fi
   if [ -z "$EFI" ] && [ "$VMEFI" = '1' ]; then
     EFI="${EFI_TARGET}"
+  elif [ -z "$RPIFIRM" ] && [ "$RPI" = '1' ]; then
+    RPIFIRM="${RPIFIRM_TARGET}"
   fi
 }
 # }}}
 
-# unmount VM image {{{
-umount_target() {
-  if [ -z "${VIRTUAL}" ] ; then
-     return 0
+# rebuild the firmware boot partition deterministically {{{
+make_fwboot_part_reproducible() {
+  local reimage_parent fwboot_part fwboot_name fwboot_object
+
+  if [ "${NO_REIMAGE}" = 'yes' ]; then
+    return 0
   fi
 
-  try_umount 3 "${MNTPOINT}"/boot/efi
-
-  try_umount 3 "${MNTPOINT}"
-  kpartx -d "${ORIG_TARGET}" >/dev/null
-  # Workaround for a bug in kpartx which doesn't clean up properly,
-  # see Debian Bug #891077 and Github-PR grml/grml-debootstrap#112
-  if dmsetup ls | grep -q "^${LOOP_PART} "; then
-    kpartx -d "/dev/${LOOP_DISK}" >/dev/null
+  if [ "${HAS_FWBOOT_PART}" = 'no' ]; then
+    return 0
   fi
+
+  # TMPDIR might be cramped if it's on a tmpfs, try to use the same disk we're
+  # generating an image on if possible
+  if [ -f "${ORIG_TARGET:-}" ]; then
+    reimage_parent="$(dirname "${ORIG_TARGET}")"
+  else
+    reimage_parent="${TMPDIR:-/tmp}"
+  fi
+  FWBOOT_REIMAGE_TREE="$(mktemp -d -p "${reimage_parent}")"
+
+  if [ -n "${EFI}" ] ; then
+    fwboot_part="${EFI}"
+    fwboot_name='EFI'
+  elif [ -n "${RPIFIRM}" ] ; then
+    fwboot_part="${RPIFIRM}"
+    fwboot_name='RPIFIRM'
+  else
+    eerror "Firmware boot partition expected but seems to not exist!"
+    bailout 1
+  fi
+
+  # Copy all files from the firmware boot partition to the reimage tree.
+  mcopy -i "${fwboot_part}" -s '::/.' "${FWBOOT_REIMAGE_TREE}/"
+  if [ -z "$(ls -A "${FWBOOT_REIMAGE_TREE}")" ]; then
+    eerror "No firmware boot files extracted from '${fwboot_part}'!"
+    bailout 1
+  fi
+
+  # Set the modification date for all files to SOURCE_DATE_EPOCH. `mcopy -m`
+  # will use this date for all file timestamps, including birth and access
+  # times.
+  find "${FWBOOT_REIMAGE_TREE}" -exec touch -d "@${SOURCE_DATE_EPOCH}" '{}' +
+
+  # Cluster slack may interfere with reproducibility, so erase the partition
+  # and rebuild it from scratch.
+  blkdiscard -f --zeroout "${fwboot_part}"
+  mkfs.fat -F32 -n "${fwboot_name}" "${fwboot_part}"
+
+  # `mcopy -i "${fwboot_part}" path/to/dir/. ::/` results in an error,
+  # "Cannot create entry named . or ..". We have to copy the files and dirs
+  # back one at a time.
+  for fwboot_object in \
+    "${FWBOOT_REIMAGE_TREE}"/* \
+    "${FWBOOT_REIMAGE_TREE}"/.* ; do
+    case "${fwboot_object##*/}" in
+      '.'|'..'|'*'|'.*') continue ;;
+    esac
+    if ! [ -e "${fwboot_object}" ]; then
+      # This shouldn't ever happen...
+      continue
+    fi
+    mcopy -i "${fwboot_part}" -s -m "${fwboot_object}" '::/'
+  done
+
+  rm -rf "${FWBOOT_REIMAGE_TREE}"
+  FWBOOT_REIMAGE_TREE=''
+}
+# }}}
+
+# save a snapshot of all files on the root filesystem {{{
+snapshot_root_filesystem() {
+  local reimage_parent
+
+  if [ "${NO_REIMAGE}" = 'yes' ]; then
+    return 0
+  fi
+
+  # This function has to be separate from the reimage_root_filesystem since
+  # this runs before the root filesystem is unmounted, while
+  # reimage_root_filesystem runs after.
+  #
+  # TMPDIR might be cramped if it's on a tmpfs, try to use the same disk we're
+  # generating an image on if possible
+  if [ -f "${ORIG_TARGET:-}" ]; then
+    reimage_parent="$(dirname "${ORIG_TARGET}")"
+  else
+    reimage_parent="${TMPDIR:-/tmp}"
+  fi
+  ROOTFS_REIMAGE_TREE="$(mktemp -d -p "${reimage_parent}")"
+
+  cp -a --one-file-system "${MNTPOINT}/." "${ROOTFS_REIMAGE_TREE}/"
+  if [ -z "$(ls -A "${ROOTFS_REIMAGE_TREE}")" ] ; then
+    eerror "Root filesystem snapshot from '${MNTPOINT}' is empty!"
+    bailout 1
+  fi
+}
+# }}}
+
+# re-image the root filesystem deterministically from the snapshot {{{
+reimage_root_filesystem() {
+  local current_uuid
+
+  if [ "${NO_REIMAGE}" = 'yes' ]; then
+    return 0
+  fi
+
+  if [ -z "${ROOTFS_REIMAGE_TREE}" ] \
+    || ! [ -d "${ROOTFS_REIMAGE_TREE}" ] ; then
+    return 0
+  fi
+
+  current_uuid="$(blkid -o value -s UUID "${TARGET}" 2>/dev/null || true)"
+  if [ "${current_uuid}" != "${FS_IDENTIFIER}" ] ; then
+    eerror "Root filesystem UUID '${current_uuid}' does not match FS_IDENTIFIER '${FS_IDENTIFIER}', reimaging the root filesystem would render the installation unbootable!"
+    bailout 1
+  fi
+
+  # Make sure to only pass -F once. This will keep mkfs.ext4 from overwriting
+  # the filesystem if it is mounted somewhere already.
+  local force_maybe
+  if printf '%s' "${MKFS_OPTS}" | grep -qw -- '-F'; then
+    force_maybe=()
+  else
+    force_maybe=( '-F' )
+  fi
+  # shellcheck disable=SC2086
+  "${MKFS}" ${MKFS_OPTS} -d "${ROOTFS_REIMAGE_TREE}" "${force_maybe[@]}" "${TARGET}"
+  rm -rf "${ROOTFS_REIMAGE_TREE}"
+  ROOTFS_REIMAGE_TREE=''
+  tunefs
 }
 # }}}
 
@@ -1544,10 +2086,13 @@ debootstrap_system() {
   # Support https mirrors.
   bootstrap_include='--include=ca-certificates'
 
+  local -a bootstrap_aptopt=()
+  [ -v SOURCE_DATE_EPOCH ] && bootstrap_aptopt+=( '--aptopt=Acquire::Check-Valid-Until "false"' )
+
   einfo "Running mmdebstrap $DEBOOTSTRAP_OPT for release ${RELEASE}${ARCHINFO} using ${MIRROR}"
-  einfo "Executing: mmdebstrap --skip=cleanup/apt --skip=check/empty $bootstrap_include $ARCHCMD $DEBOOTSTRAP_OPT $RELEASE $MNTPOINT $MIRROR"
+  einfo "Executing: mmdebstrap --skip=cleanup/apt --skip=check/empty ${bootstrap_aptopt[*]} $bootstrap_include $ARCHCMD $DEBOOTSTRAP_OPT $RELEASE $MNTPOINT $MIRROR"
   # shellcheck disable=SC2086
-  mmdebstrap --skip=cleanup/apt --skip=check/empty "$bootstrap_include" $ARCHCMD $DEBOOTSTRAP_OPT "$RELEASE" "$MNTPOINT" "$MIRROR"
+  mmdebstrap --skip=cleanup/apt --skip=check/empty "${bootstrap_aptopt[@]}" "$bootstrap_include" $ARCHCMD $DEBOOTSTRAP_OPT "$RELEASE" "$MNTPOINT" "$MIRROR"
 }
 # }}}
 
@@ -1604,6 +2149,7 @@ preparechroot() {
   [ -n "$CHROOT_SCRIPTS" ]            && echo "CHROOT_SCRIPTS='${CHROOT_SCRIPTS//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$COMPONENTS" ]                && echo "COMPONENTS='${COMPONENTS//\'/\'\\\'\'}'"                             >> "$CHROOT_VARIABLES"
   [ -n "$CONFFILES" ]                 && echo "CONFFILES='${CONFFILES//\'/\'\\\'\'}'"                               >> "$CHROOT_VARIABLES"
+  [ -n "$DPKG_OPTIONS" ]              && echo "DPKG_OPTIONS='${DPKG_OPTIONS//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
   [ -n "$DEBCONF" ]                   && echo "DEBCONF='${DEBCONF//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$DEBIAN_FRONTEND" ]           && echo "DEBIAN_FRONTEND='${DEBIAN_FRONTEND//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$DEFAULT_LOCALES" ]           && echo "DEFAULT_LOCALES='${DEFAULT_LOCALES//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
@@ -1611,11 +2157,15 @@ preparechroot() {
   [ -n "$EXTRAPACKAGES" ]             && echo "EXTRAPACKAGES='${EXTRAPACKAGES//\'/\'\\\'\'}'"                       >> "$CHROOT_VARIABLES"
   [ -n "$EFI" ]                       && echo "EFI='${EFI//\'/\'\\\'\'}'"                                           >> "$CHROOT_VARIABLES"
   [ -n "$FALLBACK_MIRROR" ]           && echo "FALLBACK_MIRROR='${FALLBACK_MIRROR//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
+  [ -n "$FALLBACK_SECURITY_MIRROR" ]  && echo "FALLBACK_SECURITY_MIRROR='${FALLBACK_SECURITY_MIRROR//\'/\'\\\'\'}'" >> "$CHROOT_VARIABLES"
   [ -n "$FILESYSTEM" ]                && echo "FILESYSTEM='${FILESYSTEM//\'/\'\\\'\'}'"                             >> "$CHROOT_VARIABLES"
+  [ -n "$FINAL_MIRROR" ]              && echo "FINAL_MIRROR='${FINAL_MIRROR//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
+  [ -n "$FINAL_SECURITY_MIRROR" ]     && echo "FINAL_SECURITY_MIRROR='${FINAL_SECURITY_MIRROR//\'/\'\\\'\'}'"       >> "$CHROOT_VARIABLES"
   [ -n "$FORCE" ]                     && echo "FORCE='${FORCE//\'/\'\\\'\'}'"                                       >> "$CHROOT_VARIABLES"
   [ -n "$GRMLREPOS" ]                 && echo "GRMLREPOS='${GRMLREPOS//\'/\'\\\'\'}'"                               >> "$CHROOT_VARIABLES"
   [ -n "$GRUB" ]                      && echo "GRUB='${GRUB//\'/\'\\\'\'}'"                                         >> "$CHROOT_VARIABLES"
   [ -n "$HOSTNAME" ]                  && echo "HOSTNAME='${HOSTNAME//\'/\'\\\'\'}'"                                 >> "$CHROOT_VARIABLES"
+  [ -n "$IMAGESIZE" ]                 && echo "IMAGESIZE='${IMAGESIZE//\'/\'\\\'\'}'"                               >> "$CHROOT_VARIABLES"
   [ -n "$INITRD" ]                    && echo "INITRD='${INITRD//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$INITRD_GENERATOR" ]          && echo "INITRD_GENERATOR='${INITRD_GENERATOR//\'/\'\\\'\'}'"                 >> "$CHROOT_VARIABLES"
   [ -n "$INITRD_GENERATOR_OPTS" ]     && echo "INITRD_GENERATOR_OPTS='${INITRD_GENERATOR_OPTS//\'/\'\\\'\'}'"       >> "$CHROOT_VARIABLES"
@@ -1631,17 +2181,21 @@ preparechroot() {
   [ -n "$PRE_SCRIPTS" ]               && echo "PRE_SCRIPTS='${PRE_SCRIPTS//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
   [ -n "$RECONFIGURE" ]               && echo "RECONFIGURE='${RECONFIGURE//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
   [ -n "$RELEASE" ]                   && echo "RELEASE='${RELEASE//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
+  [ -n "$RPI" ]                       && echo "RPI='${RPI}'"                                                        >> "$CHROOT_VARIABLES"
+  [ -n "$RPIFIRM" ]                   && echo "RPIFIRM='${RPIFIRM//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$RM_APTCACHE" ]               && echo "RM_APTCACHE='${RM_APTCACHE//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
   [ -n "$ROOTPASSWORD" ]              && echo "ROOTPASSWORD='${ROOTPASSWORD//\'/\'\\\'\'}'"                         >> "$CHROOT_VARIABLES"
+  [ -n "$ROOTPASSWORD_SALT" ]         && echo "ROOTPASSWORD_SALT='${ROOTPASSWORD_SALT//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$SCRIPTS" ]                   && echo "SCRIPTS='${SCRIPTS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
   [ -n "$SECURE" ]                    && echo "SECURE='${SECURE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
+  [ -n "$SECURITY_MIRROR" ]           && echo "SECURITY_MIRROR='${SECURITY_MIRROR//\'/\'\\\'\'}'"                   >> "$CHROOT_VARIABLES"
   [ -n "$SELECTED_PARTITIONS" ]       && echo "SELECTED_PARTITIONS='${SELECTED_PARTITIONS//\'/\'\\\'\'}'"           >> "$CHROOT_VARIABLES"
+  [ -n "$SOURCE_DATE_EPOCH" ]         && echo "SOURCE_DATE_EPOCH='${SOURCE_DATE_EPOCH//\'/\'\\\'\'}'"               >> "$CHROOT_VARIABLES"
   [ -n "$TARGET" ]                    && echo "TARGET='${TARGET//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
   [ -n "$UPGRADE_SYSTEM" ]            && echo "UPGRADE_SYSTEM='${UPGRADE_SYSTEM//\'/\'\\\'\'}'"                     >> "$CHROOT_VARIABLES"
   [ -n "$TARGET_UUID" ]               && echo "TARGET_UUID='${TARGET_UUID//\'/\'\\\'\'}'"                           >> "$CHROOT_VARIABLES"
   [ -n "$TIMEZONE" ]                  && echo "TIMEZONE='${TIMEZONE//\'/\'\\\'\'}'"                                 >> "$CHROOT_VARIABLES"
   [ -n "$TUNE2FS" ]                   && echo "TUNE2FS='${TUNE2FS//\'/\'\\\'\'}'"                                   >> "$CHROOT_VARIABLES"
-  [ -n "$VMSIZE" ]                    && echo "VMSIZE='${VMSIZE//\'/\'\\\'\'}'"                                     >> "$CHROOT_VARIABLES"
 
   cp ${VERBOSE:+-v} "${CONFFILES}"/chroot-script "${MNTPOINT}"/bin/chroot-script
   chmod 755 "${MNTPOINT}"/bin/chroot-script
@@ -1753,6 +2307,10 @@ iface ${interface} inet dhcp
     echo "$DEFAULT_INTERFACES" > "${MNTPOINT}/etc/network/interfaces"
   elif [ -n "$VIRTUAL" ] ; then
     einfo "Setting up Virtual Machine, installing default /etc/network/interfaces"
+    mkdir -p "${MNTPOINT}/etc/network"
+    echo "$DEFAULT_INTERFACES" > "${MNTPOINT}/etc/network/interfaces"
+  elif [ -n "$RPI" ] ; then
+    einfo "Setting up Raspberry Pi installation, installing default /etc/network/interfaces"
     mkdir -p "${MNTPOINT}/etc/network"
     echo "$DEFAULT_INTERFACES" > "${MNTPOINT}/etc/network/interfaces"
   elif [ -r /etc/network/interfaces ] ; then
@@ -1900,7 +2458,7 @@ chrootscript() {
 }
 # }}}
 
-# unmount $MNTPOINT {{{
+# unmount $MNTPOINT, tear down loop devices and reimage filesystems {{{
 umount_chroot() {
 
   # display installation notes:
@@ -1908,10 +2466,31 @@ umount_chroot() {
      [ -r "${MNTPOINT}/${INSTALL_NOTES}" ] && cat "${MNTPOINT}/${INSTALL_NOTES}"
   fi
 
+  try_umount 3 "${MNTPOINT}"/boot/efi
+  try_umount 3 "${MNTPOINT}"/boot/firmware
+  if [ -v SOURCE_DATE_EPOCH ] && [ "${HAS_FWBOOT_PART}" = 'yes' ] ; then
+    make_fwboot_part_reproducible
+  fi
+
   try_umount 3 "${MNTPOINT}"/run/udev
 
   if [ -n "$PARTITION" ] ; then
-     try_umount 3 "$MNTPOINT"
+    if [ -v SOURCE_DATE_EPOCH ] ; then
+      snapshot_root_filesystem
+    fi
+    try_umount 3 "$MNTPOINT"
+    if [ -v SOURCE_DATE_EPOCH ] ; then
+      reimage_root_filesystem
+    fi
+
+    if [ -n "${VIRTUAL}" ] || [ -n "$RPI" ] ; then
+      kpartx -d "${ORIG_TARGET}" >/dev/null
+      # Workaround for a bug in kpartx which doesn't clean up properly,
+      # see Debian Bug #891077 and Github-PR grml/grml-debootstrap#112
+      if dmsetup ls | grep -q "^${LOOP_PART} " ; then
+        kpartx -d "/dev/${LOOP_DISK}" >/dev/null
+      fi
+    fi
   fi
 }
 # }}}
@@ -1948,10 +2527,10 @@ remove_configs() {
 # }}}
 
 # now execute all the functions {{{
-for i in format_efi_partition prepare_vm mkfs tunefs \
+for i in format_fwboot_partitions prepare_image mkfs tunefs \
          mount_target mountpoint_to_blockdevice debootstrap_system \
          preparechroot execute_pre_scripts chrootscript execute_post_scripts \
-         remove_configs umount_chroot umount_target fscktool ; do
+         remove_configs umount_chroot fscktool ; do
     if stage "${i}" ; then
       "$i"
       stage "${i}" 'done'

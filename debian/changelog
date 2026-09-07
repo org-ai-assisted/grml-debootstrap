@@ -1,3 +1,55 @@
+grml-debootstrap (0.128) unstable; urgency=medium
+
+  * [db0fdeb] Increase size of release selection dialog
+  * [e081448] Add forky as a selectable release
+  * [ee6d205] tests: pass correct serial device to kernel
+  * [c6b22ad] tests: print qemu.log if qemu went AWOL on test end
+  * [7d5be68] tests: avoid crashing QEMU on ubuntu-24.04-arm
+
+ -- Chris Hofstaedtler <ch@grml.org>  Tue, 05 May 2026 18:17:48 +0200
+
+grml-debootstrap (0.127) unstable; urgency=medium
+
+  * CI changes only.
+
+ -- Chris Hofstaedtler <ch@grml.org>  Tue, 28 Apr 2026 16:44:03 +0200
+
+grml-debootstrap (0.126) unstable; urgency=medium
+
+  * Maintenance release to fix build-time inclusion of empty
+    "etc" directory into tarball.
+
+ -- Chris Hofstaedtler <ch@grml.org>  Mon, 16 Mar 2026 15:44:47 +0100
+
+grml-debootstrap (0.125) unstable; urgency=medium
+
+  [ Aaron Rainbolt ]
+  * [da46e1a] Use deb822 sources format everywhere
+  * [9633862] Add Raspberry Pi image generation support
+  * [fe244d7] Install default network interfaces config for RPi systems
+  * [2ab8815] Add RPi image CI testing
+
+ -- Chris Hofstaedtler <ch@grml.org>  Thu, 12 Feb 2026 23:09:44 +0100
+
+grml-debootstrap (0.124) unstable; urgency=medium
+
+  * [8ca3b23] Drop support for Debian v11 / bullseye
+  * [34c3fa9] package selection: replace isc-dhcp-client with dhcpcd-base
+  * [f3299a7] help message: drop incorrect default value
+
+ -- Chris Hofstaedtler <ch@grml.org>  Sun, 25 Jan 2026 17:51:56 +0100
+
+grml-debootstrap (0.123) unstable; urgency=medium
+
+  [ Chris Hofstaedtler ]
+  * [f88c07b] Rename asciidoc files to *.adoc
+  * [02b0da4] Update GitHub README.md
+  * [e4e361a] Add package-build, release GitHub workflows
+  * [fdad144] Add dependabot configuration
+  * [4341805] d/copyright: remove (old) FSF address
+
+ -- Chris Hofstaedtler <ch@grml.org>  Mon, 03 Nov 2025 13:01:17 +0100
+
 grml-debootstrap (0.122) unstable; urgency=medium
 
   * [8172dda] Skip udevadm execution on unsupported network interfaces

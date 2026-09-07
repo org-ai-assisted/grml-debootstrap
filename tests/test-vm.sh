@@ -6,15 +6,16 @@
 
 set -eu -o pipefail
 
-if [ "$#" -ne 2 ]; then
+if [ "$#" -ne 3 ]; then
   echo "$0: Invalid arguments" >&2
-  echo "Expect: $0 VM_IMAGE VM_HOSTNAME" >&2
+  echo "Expect: $0 VM_IMAGE VM_HOSTNAME TARGET" >&2
   exit 1
 fi
 set -x
 
 VM_IMAGE="$1"
 VM_HOSTNAME="$2"
+TARGET="$3"
 
 TEST_PWD="$PWD"
 TEST_TMPDIR=$(mktemp -d)
@@ -28,7 +29,7 @@ bailout() {
     ps --pid="${QEMU_PID}" -o pid= | grep -q '.' && kill "${QEMU_PID:-}"
   fi
 
-  rm -rf "${TEST_TMPDIR}"
+  sudo rm -rf "${TEST_TMPDIR}"
 
   [ -n "${1:-}" ] && EXIT_CODE="$1" || EXIT_CODE=1
   exit "$EXIT_CODE"
@@ -72,19 +73,32 @@ declare -a qemu_command
 
 DPKG_ARCHITECTURE=$(dpkg --print-architecture)
 if [ "${DPKG_ARCHITECTURE}" = "amd64" ]; then
-    qemu_command=( qemu-system-x86_64 )
-    qemu_command+=( -machine q35 )
+  qemu_command=( qemu-system-x86_64 )
+  qemu_command+=( -machine q35 )
+  qemu_command+=( -cpu max )
 elif [ "${DPKG_ARCHITECTURE}" = "arm64" ]; then
+  # Pick a real CPU model, and also one that does not crash QEMU on ubuntu-24.04-arm.
+  qemu_command=( qemu-system-aarch64 )
+  qemu_command+=( -machine "type=virt,gic-version=max,accel=kvm:tcg" )
+  qemu_command+=( -cpu cortex-a76 )
+  if [ "$TARGET" = 'RPI' ]; then
+    if ! rpi_bootdata="$(sudo "$TEST_PWD"/tests/extract-rpi-bootdata.sh "$VM_IMAGE")"; then
+      echo "E: could not extract RPi boot data" >&2
+      exit 1
+    fi
+    IFS='|' read rpi_kern rpi_initrd rpi_kerncmd <<< "$rpi_bootdata"
+    qemu_command+=( -kernel "$rpi_kern" )
+    qemu_command+=( -initrd "$rpi_initrd" )
+    qemu_command+=( -append "$rpi_kerncmd" )
+  else
     cp /usr/share/AAVMF/AAVMF_VARS.fd efi_vars.fd
-    qemu_command=( qemu-system-aarch64 )
-    qemu_command+=( -machine "type=virt,gic-version=max,accel=kvm:tcg" )
     qemu_command+=( -drive "if=pflash,format=raw,unit=0,file.filename=/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd,file.locking=off,readonly=on" )
     qemu_command+=( -drive "if=pflash,format=raw,unit=1,file=efi_vars.fd" )
+  fi
 else
-    echo "E: unsupported ${DPKG_ARCHITECTURE}"
-    exit 1
+  echo "E: unsupported ${DPKG_ARCHITECTURE}" >&2
+  exit 1
 fi
-qemu_command+=( -cpu max )
 qemu_command+=( -smp 2 )
 qemu_command+=( -m 2048 )
 qemu_command+=( -drive "file=${VM_IMAGE},format=raw,index=0,media=disk" )
@@ -110,6 +124,13 @@ if [ ! -d results ] || [ ! -f ./results/goss.tap ] || [ ! -f ./results/goss.exit
   echo "Running tests inside VM failed for unknown reason" >&2
   RC=1
   cat results/goss.err || true
+  if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
+    echo "E: qemu (pid ${QEMU_PID}) has exited" >&2
+  fi
+  if [ -r qemu.log ]; then
+    echo "qemu.log follows:" >&2
+    cat qemu.log >&2
+  fi
 else
   RC=$(cat results/goss.exitcode)
   echo "goss exitcode: $RC"

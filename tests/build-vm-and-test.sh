@@ -4,6 +4,7 @@
 # Install an already built grml-debootstrap.deb in docker and use it to
 # build a test VM image. Then run this VM image in qemu and check if it
 # boots.
+GOSS_VER="0.4.9"
 
 set -eu -o pipefail
 
@@ -42,7 +43,10 @@ if [ "$1" == "setup" ]; then
   fi
   # vncsnapshot might not be available, though we don't want to abort execution then
   sudo apt-get -qq -y install vncsnapshot || true
-  [ -x ./tests/goss ] || curl -fsSL https://goss.rocks/install | GOSS_DST="$(pwd)/tests" sh
+  if ! [ -e ./tests/goss ] ; then
+    curl -fsSL --output "tests/goss" "https://github.com/goss-org/goss/releases/download/v${GOSS_VER}/goss-linux-${DPKG_ARCHITECTURE}"
+    chmod a+rx tests/goss
+  fi
   # TODO: docker.io
   exit 0
 fi
@@ -50,7 +54,9 @@ fi
 # Debian version to install using grml-debootstrap
 RELEASE="${RELEASE:-trixie}"
 
-TARGET="${TARGET:-qemu.img}"
+TARGET="${TARGET:-no}"
+
+QEMU_IMG="${QEMU_IMG:-qemu.img}"
 
 if [ "$1" == "run" ]; then
   # Debian version on which grml-debootstrap will *run*
@@ -68,11 +74,11 @@ if [ "$1" == "run" ]; then
     -e TERM="$TERM" \
     -w /code \
     debian:"$HOST_RELEASE" \
-    bash -c './tests/docker-install-deb.sh '"$DEB_NAME"' && ./tests/docker-build-vm.sh '"$(id -u)"' '"/code/$TARGET"' '"$RELEASE"
+    bash -c './tests/docker-install-deb.sh '"$DEB_NAME"' && ./tests/docker-build-vm.sh '"$(id -u)"' '"/code/$QEMU_IMG"' '"$RELEASE"' '"$TARGET"
 
 elif [ "$1" == "test" ]; then
   # run tests from inside Debian system
-  exec ./tests/test-vm.sh "$PWD/$TARGET" "$RELEASE"
+  exec ./tests/test-vm.sh "$PWD/$QEMU_IMG" "$RELEASE" "$TARGET"
 
 else
   echo "$0: unknown parameters, see --help" >&2

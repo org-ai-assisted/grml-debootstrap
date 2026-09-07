@@ -11,6 +11,7 @@
 # shellcheck disable=SC2317  # shellcheck has trouble understanding the code flow in this file
 
 # error_handler {{{
+# shellcheck disable=SC2329
 error_handler() {
    last_exit_code="$?"
    last_bash_command="$BASH_COMMAND"
@@ -32,8 +33,16 @@ bash -n /etc/debootstrap/variables
 # shellcheck source=tests/shellcheck-stub-debootstrap-variables
 . /etc/debootstrap/variables || exit 1
 
+# Make sure all tools see SOURCE_DATE_EPOCH if it's available
+[ -v SOURCE_DATE_EPOCH ] && export SOURCE_DATE_EPOCH
+
 [ -r /proc/1 ] || mount -t proc none /proc
 [ -r /sys/kernel ] || mount -t sysfs none /sys
+
+if [ -n "$RPIFIRM" ]; then
+  mkdir --parents /boot/firmware
+  mount "$RPIFIRM" /boot/firmware
+fi
 
 # variable checks {{{
 
@@ -67,6 +76,7 @@ stage() {
   return 0
 }
 
+# shellcheck disable=SC2329
 askpass() {
   # read -s emulation for dash. result is in $resp.
   set -o noglob
@@ -78,14 +88,8 @@ askpass() {
 # }}}
 
 # mark existing packages as automatically installed {{{
+# shellcheck disable=SC2329
 markauto() {
-  case "$RELEASE" in
-    bullseye)
-      # apt-mark is unavailable or does not support all used patterns.
-      return
-      ;;
-  esac
-
   # Mark most leaf packages as automatically installed.
   # Later in the systems life, apt autoremove will remove them if possible.
   apt-mark auto '~i !~M ?not(?priority(required)) ?not(?priority(important)) ?not(?priority(standard))'
@@ -94,7 +98,7 @@ markauto() {
 
 # write a deb822 sources stanza to a file {{{
 writesource() {
-  local file types uris suites components signed_by
+  local file types uris suites components signed_by check_valid_until
 
   file="${1:-}"
   types="${2:-}"
@@ -102,6 +106,7 @@ writesource() {
   suites="${4:-}"
   components="${5:-}"
   signed_by="${6:-}"
+  check_valid_until="${7:-}"
 
   mkdir -p "$(dirname "${file}")"
 
@@ -117,116 +122,19 @@ writesource() {
   if [ -n "$signed_by" ]; then
     echo "Signed-By: $signed_by" >> "$file"
   fi
-}
-# }}}
-
-# delete deb822 sources stanzas from a file if they match the specified
-# variables {{{
-deletesource() {
-  local file types uris suites components signed_by
-
-  file="${1:-}"
-  types="${2:-}"
-  uris="${3:-}"
-  suites="${4:-}"
-  components="${5:-}"
-  signed_by="${6:-}"
-
-  local stanza_contents current_types current_uris current_suites \
-    current_components current_signed_by line do_omit file_contents
-  stanza_contents=""
-  current_types=""
-  current_uris=""
-  current_suites=""
-  current_components=""
-  current_signed_by=""
-  do_omit='y'
-  file_contents=""
-
-  while read -r line; do
-    if [[ "$line" =~ ^[:space:]*# ]]; then
-      if [ -z "$stanza_contents" ]; then
-        file_contents+="$line"$'\n'
-      else
-        stanza_contents+="$line"$'\n'
-      fi
-      continue
-    fi
-
-    line="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//;' <<< "$line")"
-    if [ -z "$line" ]; then
-      if [ -n "$types" ] \
-        && [ "$types" != "$current_types" ]; then
-        do_omit='n'
-      elif [ -n "$uris" ] \
-        && [ "$uris" != "$current_uris" ]; then
-        do_omit='n'
-      elif [ -n "$suites" ] \
-        && [ "$suites" != "$current_suites" ]; then
-        do_omit='n'
-      elif [ -n "$components" ] \
-        && [ "$components" != "$current_components" ]; then
-        do_omit='n'
-      elif [ -n "$signed_by" ] \
-        && [ "$signed_by" != "$current_signed_by" ]; then
-        do_omit='n'
-      elif [ -z "$current_types" ] \
-        && [ -z "$current_uris" ] \
-        && [ -z "$current_suites" ] \
-        && [ -z "$current_components" ] \
-        && [ -z "$current_signed_by" ]; then
-        do_omit='n'
-      fi
-
-      if [ "$do_omit" = 'n' ]; then
-        file_contents+="$stanza_contents"$'\n'
-      fi
-
-      stanza_contents=""
-      current_types=""
-      current_uris=""
-      current_suites=""
-      current_components=""
-      current_signed_by=""
-      do_omit='y'
-
-      continue
-    fi
-
-    stanza_contents+="$line"$'\n'
-    if [[ "$line" =~ ^Types: ]]; then
-      current_types="$(cut -d' ' -f2- <<< "$line")"
-      continue
-    fi
-    if [[ "$line" =~ ^URIs: ]]; then
-      current_uris="$(cut -d' ' -f2- <<< "$line")"
-      continue
-    fi
-    if [[ "$line" =~ ^Suites: ]]; then
-      current_suites="$(cut -d' ' -f2- <<< "$line")"
-      continue
-    fi
-    if [[ "$line" =~ ^Components: ]]; then
-      current_components="$(cut -d' ' -f2- <<< "$line")"
-      continue
-    fi
-    if [[ "$line" =~ ^Signed-By: ]]; then
-      current_signed_by="$(cut -d' ' -f2- <<< "$line")"
-      continue
-    fi
-
-  # Extra echo piped in so that the variable parsing code runs for the last
-  # stanza
-  done < <(cat "$file"; echo '')
-
-  # Strip leading and trailing newliens
-  file_contents="$(sed -z 's/^\n*//; s/\n*$//;' <<< "$file_contents")"
-  echo "$file_contents" > "$file"
+  if [ -n "$check_valid_until" ]; then
+    echo "Check-Valid-Until: $check_valid_until" >> "$file"
+  fi
 }
 # }}}
 
 # define chroot mirror {{{
+# shellcheck disable=SC2329
 chrootmirror() {
+  local omit_check_valid_until check_valid_until
+  omit_check_valid_until="${1:-}"
+  check_valid_until=''
+
   if [ "$KEEP_SRC_LIST" = "yes" ] ; then
     echo "KEEP_SRC_LIST has been enabled, skipping chrootmirror stage."
     return
@@ -237,28 +145,41 @@ chrootmirror() {
   fi
   echo "Using repository components $COMPONENTS"
 
+  [ -v SOURCE_DATE_EPOCH ] && [ -z "${omit_check_valid_until}" ] \
+    && check_valid_until='no'
+
   if [ -n "$MIRROR" ] ; then
     echo "Deleting obsolete sources.list"
     rm -f /etc/apt/sources.list
 
-    echo "Adjusting sources.list.d/debian.sources for mirror (${MIRROR})."
-    writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+    if grep -q 'file:' <<< "$MIRROR" ; then
+      echo "Adjusting sources.list.d/local.sources for mirror (${MIRROR})."
+      writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+    else
+      echo "Adjusting sources.list.d/debian.sources for mirror (${MIRROR})."
+      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+    fi
   fi
 
-  # add security.debian.org:
+  # add security mirror:
   case "$RELEASE" in
     unstable|sid) ;;  # no security pool available
     *)
-      # bullseye and newer releases use a different repository layout, see
       # https://lists.debian.org/debian-devel-announce/2019/07/msg00004.html
-      echo "Adding security.debian.org/debian-security to sources.list.d/debian.sources."
-      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' 'http://security.debian.org/debian-security' "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+      if grep -q 'file:' <<< "$SECURITY_MIRROR" ; then
+        echo "Adding security mirror to sources.list.d/local.sources."
+        writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+      else
+        echo "Adding security mirror to sources.list.d/debian.sources."
+        writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+      fi
       ;;
   esac
 }
 # }}}
 
 # remove local chroot mirror {{{
+# shellcheck disable=SC2329
 remove_chrootmirror() {
   if [ "$KEEP_SRC_LIST" = "yes" ] ; then
     echo "KEEP_SRC_LIST has been enabled, skipping remove_chrootmirror stage."
@@ -266,15 +187,23 @@ remove_chrootmirror() {
   fi
 
   if [ -n "$MIRROR" ] && echo "$MIRROR" | grep -q 'file:' ; then
-    echo "Removing local mirror (${MIRROR}) from sources.list.d/debian.sources."
-    deletesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS"
+    echo "Removing local.sources."
+    rm -f /etc/apt/sources.list.d/local.sources
     echo "Adding fallback mirror entry (${FALLBACK_MIRROR}) to sources.list.d/debian.sources instead."
     writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FALLBACK_MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+  fi
+
+  if [ -n "$SECURITY_MIRROR" ] && echo "$SECURITY_MIRROR" | grep -q 'file:' ; then
+    echo "Removing local.sources if necessary."
+    rm -rf /etc/apt/sources.list.d/local.sources
+    echo "Adding fallback security mirror entry (${FALLBACK_SECURITY_MIRROR}) to sources.list.d/debian.sources instead."
+    writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FALLBACK_SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
   fi
 }
 # }}}
 
 # set up grml repository {{{
+# shellcheck disable=SC2329
 grmlrepos() {
   if [ -z "$GRMLREPOS" ] ; then
     return 0
@@ -317,29 +246,22 @@ EOF
 # }}}
 
 # feature to provide Debian backports repos {{{
+# shellcheck disable=SC2329
 backportrepos() {
   if [ -n "$BACKPORTREPOS" ] ; then
+    local omit_check_valid_until check_valid_until
+    omit_check_valid_until="${1:-}"
+    check_valid_until=''
+    [ -v SOURCE_DATE_EPOCH ] && [ -z "${omit_check_valid_until}" ] \
+      && check_valid_until='no'
     echo "# debian backports: ${RELEASE}-backports repository:" >> /etc/apt/sources.list.d/backports.sources
-    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg'
-  fi
-}
-# }}}
-
-# set up kernel-img.conf {{{
-kernelimg_conf() {
-  if ! [ -r /etc/kernel-img.conf ] ; then
-     echo "Setting up /etc/kernel-img.conf"
-     cat > /etc/kernel-img.conf << EOF
-# Kernel Image management overrides
-# See kernel-img.conf(5) for details
-do_initrd = Yes
-do_symlinks = Yes
-EOF
+    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
   fi
 }
 # }}}
 
 # make sure services do not start up {{{
+# shellcheck disable=SC2329
 install_policy_rcd() {
   if ! [ -r /usr/sbin/policy-rc.d ] ; then
      export POLICYRCD=1
@@ -354,6 +276,7 @@ EOF
 # }}}
 
 # make sure we have an up2date system {{{
+# shellcheck disable=SC2329
 upgrade_system() {
   if [ "$UPGRADE_SYSTEM" = "yes" ] ; then
     echo "Running update + upgrade"
@@ -365,7 +288,9 @@ upgrade_system() {
 }
 
 # }}}
+
 # remove now useless apt cache {{{
+# shellcheck disable=SC2329
 remove_apt_cache() {
   if [ "$RM_APTCACHE" = 'yes' ] ; then
     echo "Cleaning apt cache."
@@ -378,6 +303,7 @@ remove_apt_cache() {
 # }}}
 
 # install additional packages {{{
+# shellcheck disable=SC2329
 packages() {
   # Pre-seed the debconf database with answers. Each question will be marked
   # as seen to prevent debconf from asking the question interactively.
@@ -403,6 +329,7 @@ packages() {
 # }}}
 
 # install extra packages {{{
+# shellcheck disable=SC2329
 extrapackages() {
     if [ "$EXTRAPACKAGES" = 'yes' ] ; then
         PACKAGELIST=$(find /etc/debootstrap/extrapackages -type f -name '*.deb')
@@ -417,14 +344,15 @@ extrapackages() {
 # }}}
 
 # check if the specified Debian package exists
+# shellcheck disable=SC2329
 package_exists() {
   output=$(apt-cache show "$1" 2>/dev/null)
   [ -n "$output" ]
   return $?
 }
 
-
 # determine the kernel version postfix
+# shellcheck disable=SC2329
 get_kernel_version() {
   # do not override $KERNEL if set via config file
   if [ -n "$KERNEL" ] ; then
@@ -446,6 +374,7 @@ get_kernel_version() {
 }
 
 # install kernel packages {{{
+# shellcheck disable=SC2329
 kernel() {
   if [ -n "$NOKERNEL" ] ; then
     echo "Skipping installation of kernel packages as requested via --nokernel"
@@ -460,6 +389,9 @@ kernel() {
      if expr "$COMPONENTS" : '.*non-free' >/dev/null ; then
        KERNELPACKAGES="$KERNELPACKAGES firmware-linux"
      fi
+     if [ -n "$RPI" ] ; then
+       KERNELPACKAGES="$KERNELPACKAGES raspi-firmware"
+     fi
      # shellcheck disable=SC2086
      DEBIAN_FRONTEND=$DEBIAN_FRONTEND $APTINSTALL $KERNELPACKAGES
   else
@@ -468,11 +400,25 @@ kernel() {
 }
 # }}}
 
+# fix kernel command line for Raspberry Pi {{{
+rpi_cmdline() {
+  if [ -z "$RPI" ]; then
+    return 0
+  fi
+
+  local cmdline
+  cmdline="$(cat /boot/firmware/cmdline.txt)"
+  cmdline="$(sed "s/root=[^ ]*/root=UUID=${TARGET_UUID}/" <<< "$cmdline")"
+  echo "$cmdline" > /boot/firmware/cmdline.txt
+}
+# }}}
+
 # reconfigure packages {{{
+# shellcheck disable=SC2329
 reconfigure() {
   if [ -n "$RECONFIGURE" ] ; then
      for package in $RECONFIGURE ; do
-         if dpkg --list "$package" >/dev/null 2>&1 | grep -q '^ii' ; then
+         if dpkg --list "$package" 2>/dev/null | grep -q '^ii' ; then
            DEBIAN_FRONTEND=$DEBIAN_FRONTEND dpkg-reconfigure "$package" || \
            echo "Warning: $package does not exist, can not reconfigure it."
          fi
@@ -482,6 +428,7 @@ reconfigure() {
 # }}}
 
 # set password of user root {{{
+# shellcheck disable=SC2329
 passwords()
 {
   if [ -n "$NOPASSWORD" ] ; then
@@ -489,15 +436,23 @@ passwords()
     return 0
   fi
 
-  CHPASSWD_OPTION=
-  if chpasswd --help 2>&1 | grep -q -- '-m,' ; then
-     CHPASSWD_OPTION='-m'
-  fi
-
   if [ -n "$ROOTPASSWORD" ] ; then
-     # shellcheck disable=SC2086
-     echo root:"$ROOTPASSWORD" | chpasswd $CHPASSWD_OPTION
-     export ROOTPASSWORD=''
+    if [ -v SOURCE_DATE_EPOCH ]; then
+      local pass_hash
+      pass_hash="$(perl -e \
+        'print crypt($ARGV[0], "\$y\$j9T\$".$ARGV[1]."\$")' \
+        "$ROOTPASSWORD" "$ROOTPASSWORD_SALT")"
+      # Regex taken from the 'yescrypt' section of 'man 5 crypt'
+      if ! [[ "${pass_hash}" =~ \$y\$[./A-Za-z0-9]+\$[./A-Za-z0-9]{,86}\$[./A-Za-z0-9]{43} ]]; then
+        echo "Error: failed to generate a reproducible password hash."
+        exit 1
+      fi
+      echo "root:${pass_hash}" | chpasswd -e
+    else
+      # shellcheck disable=SC2086
+      echo root:"$ROOTPASSWORD" | chpasswd
+    fi
+    export ROOTPASSWORD=''
   else
     a='1'
     b='2'
@@ -519,7 +474,7 @@ passwords()
          b='2'
        else
          # shellcheck disable=SC2086
-         echo root:"$a" | chpasswd $CHPASSWD_OPTION
+         echo root:"$a" | chpasswd
          unset a
          unset b
        fi
@@ -529,6 +484,7 @@ passwords()
 # }}}
 
 # set up /etc/hosts {{{
+# shellcheck disable=SC2329
 hosts() {
   if ! [ -f /etc/hosts ] ; then
      cat > /etc/hosts << EOF
@@ -542,6 +498,7 @@ EOF
 # }}}
 
 # set default locales {{{
+# shellcheck disable=SC2329
 default_locales() {
   if [ -n "$DEFAULT_LOCALES" ] ; then
     if ! [ -x /usr/sbin/update-locale ] ; then
@@ -556,6 +513,7 @@ default_locales() {
 # }}}
 
 # adjust timezone {{{
+# shellcheck disable=SC2329
 timezone() {
   if [ -n "$TIMEZONE" ] ; then
     echo "Adjusting /etc/localtime"
@@ -572,10 +530,17 @@ timezone() {
 # }}}
 
 # helper function for fstab() {{{
+# shellcheck disable=SC2329
 createfstab(){
   echo "Setting up /etc/fstab"
+  local fstab_created_on
+  if [ -v SOURCE_DATE_EPOCH ]; then
+    fstab_created_on="$(LC_ALL=C date -u -d "@${SOURCE_DATE_EPOCH}")"
+  else
+    fstab_created_on="$(date)"
+  fi
   cat > /etc/fstab <<EOF
-# /etc/fstab - created by grml-debootstrap on $(date)
+# /etc/fstab - created by grml-debootstrap on ${fstab_created_on}
 # Accessible filesystems, by reference, are maintained under '/dev/disk/'.
 # See man pages fstab(5), findfs(8), mount(8) and/or blkid(8) for more info.
 #
@@ -608,6 +573,11 @@ if [ -n "$EFI" ] ; then
   echo "UUID=$UUID_EFI  /boot/efi       vfat    umask=0077      0       1" >> /etc/fstab
 fi
 
+if [ -n "$RPIFIRM" ] ; then
+  UUID_RPIFIRM="$(blkid -o value -s UUID "$RPIFIRM")"
+  echo "UUID=$UUID_RPIFIRM  /boot/firmware       vfat    umask=0077      0       1" >> /etc/fstab
+fi
+
 cat >> /etc/fstab << EOF
 proc           /proc        proc    defaults                      0   0
 /dev/cdrom     /mnt/cdrom0  iso9660 ro,user,noauto                0   0
@@ -623,6 +593,7 @@ EOF
 # }}}
 
 # generate /etc/fstab {{{
+# shellcheck disable=SC2329
 fstab() {
   # set up /etc/fstab if file is UNCONFIGURED (debootstrap, mmdebstrap)
   if grep -q UNCONFIGURED /etc/fstab ; then
@@ -632,6 +603,7 @@ fstab() {
 # }}}
 
 # ensure we have according filesystem tools available {{{
+# shellcheck disable=SC2329
 install_fs_tools() {
   local pkg=""
 
@@ -654,6 +626,7 @@ install_fs_tools() {
 # }}}
 
 # set up hostname {{{
+# shellcheck disable=SC2329
 hostname() {
   if [ -n "$HOSTNAME" ] ; then
      echo "Setting hostname to ${HOSTNAME}."
@@ -688,6 +661,7 @@ hostname() {
 # }}}
 
 # generate initrd/initramfs {{{
+# shellcheck disable=SC2329
 initrd() {
   # assume the first available kernel as our main kernel
   # shellcheck disable=SC2012
@@ -713,6 +687,7 @@ initrd() {
 }
 # }}}
 
+# shellcheck disable=SC2329
 efi_setup() {
   if [ -z "$EFI" ] ; then
     return 0
@@ -742,6 +717,7 @@ efi_setup() {
 
 # helper function to get relevant /dev/disk/by-id/* entries,
 # based on GRUB's postinst script
+# shellcheck disable=SC2329
 available_ids() {
   local path ids
 
@@ -757,6 +733,7 @@ available_ids() {
 
 # helper function to report corresponding /dev/disk/by-id/ for a given device name,
 # based on GRUB's postinst script
+# shellcheck disable=SC2329
 device_to_id() {
   local id
 
@@ -777,29 +754,26 @@ device_to_id() {
   return 1
 }
 
+# shellcheck disable=SC2329
 is_grub_bios_compatible() {
   # Check if the disk uses an MSDOS partition table, these are always compatible
   if [[ "$(blkid "$GRUB")" =~ 'PTTYPE="dos"' ]]; then
     return 0
   # Look for a BIOS boot partition otherwise
   else
-    SEARCH_STR="$GRUB"
-    if [[ "$SEARCH_STR" =~ ^/dev/loop ]]; then
-      SEARCH_STR="${SEARCH_STR//\/dev\//}" # loopX
-      SEARCH_STR="/dev/mapper/${SEARCH_STR}" # /dev/mapper/loopX
-      # Note that /dev/mapper/loopX won't actually exist, but
-      # /dev/mapper/loopXpY will, so this works for the regex check in the
-      # while loop below.
+    # Scanning the output of lsblk is unreliable in some environments. partx
+    # seems to work better.
+    local partx_types
+    partx_types="$(partx --show --noheadings --output TYPE "$GRUB")" || true
+    if [[ "${partx_types}" \
+      =~ (^|$'\n')21686148-6449-6e6f-744e-656564454649($'\n'|$) ]]; then
+      return 0
     fi
-    while read -r line; do
-      if [[ "$line" =~ ^${SEARCH_STR}.*21686148-6449-6e6f-744e-656564454649$ ]]; then
-        return 0
-      fi
-    done < <(lsblk -pnlo NAME,PARTTYPE)
   fi
   return 1
 }
 
+# shellcheck disable=SC2329
 run_grub_install() {
   grub_install_cmd=( 'grub-install' "$@" )
   if ! "${grub_install_cmd[@]}" ; then
@@ -808,6 +782,7 @@ run_grub_install() {
   fi
 }
 
+# shellcheck disable=SC2329
 grub_install() {
   if [ -z "$GRUB" ] ; then
     echo "Notice: \$GRUB not defined, will not install grub inside chroot at this stage."
@@ -916,6 +891,7 @@ grub_install() {
 # }}}
 
 # execute all scripts present in /etc/debootstrap/chroot-scripts/ {{{
+# shellcheck disable=SC2329
 custom_scripts() {
   [ -d /etc/debootstrap/chroot-scripts/ ] || return 0
 
@@ -927,6 +903,7 @@ custom_scripts() {
 # }}}
 
 # make sure we don't have any running processes left {{{
+# shellcheck disable=SC2329
 services() {
   for service in ssh mdadm mdadm-raid ; do
     if [ -x /etc/init.d/"$service" ] ; then
@@ -937,6 +914,7 @@ services() {
 # }}}
 
 # unmount /proc and make sure nothing is left {{{
+# shellcheck disable=SC2329
 finalize() {
   # make sure we don't leave any sensible data
   rm -f /etc/debootstrap/variables
@@ -947,10 +925,75 @@ finalize() {
 
   umount /sys >/dev/null 2>/dev/null || true
   umount /proc >/dev/null 2>/dev/null || true
+
+  umount /boot/firmware >/dev/null 2>/dev/null || true
+}
+# }}}
+
+# reproducible-build finalization {{{
+reproducible_finalize() {
+  [ -v SOURCE_DATE_EPOCH ] || return 0
+  echo "Applying reproducible-build finalization."
+
+  # Regenerate apt sources with their final values.
+  if [ -n "${FINAL_MIRROR}" ]; then
+    MIRROR="${FINAL_MIRROR}"
+  fi
+  if [ -n "${FINAL_SECURITY_MIRROR}" ]; then
+    SECURITY_MIRROR="${FINAL_SECURITY_MIRROR}"
+  fi
+  rm -f '/etc/apt/sources.list.d/debian.sources'
+  rm -f '/etc/apt/sources.list.d/backports.sources'
+  chrootmirror 'omit-check-valid-until'
+  backportrepos 'omit-check-valid-until'
+  remove_chrootmirror
+
+  # stale apt repository information
+  find /var/lib/apt/lists -mindepth 1 -maxdepth 1 -type f -delete
+  find /var/lib/apt/lists/auxfiles -mindepth 1 -maxdepth 1 -type f -delete
+  find /var/lib/apt/lists/partial -mindepth 1 -maxdepth 1 -type f -delete
+
+  # SSH host keys
+  rm -f /etc/ssh/ssh_host_*
+
+  # Postfix aliases.db
+  # TODO: Simply deleting this file may cause problems for the system
+  # admnistrator later. Modifying it requires adding db-util to the image.
+  # Regenerating it with a fixed timestamp seems to be impossible (newaliases
+  # does not support it, and running newaliases under 'faketime -f' causes it
+  # to freeze indefinitely).
+  rm -f /etc/aliases.db
+
+  # machine-id
+  printf 'uninitialized\n' > /etc/machine-id
+  rm -f /var/lib/dbus/machine-id # copied from /etc/machine-id on boot
+
+  # logs
+  rm -f /var/log/alternatives.log /var/log/dpkg.log /var/log/apt/history.log \
+    /var/log/apt/term.log
+
+  # ldconfig auxiliary cache (this seems to be undocumented, ldconfig
+  # regenerates it)
+  rm -f /var/cache/ldconfig/aux-cache
+
+  # files that shouldn't have gotten stuck in /run but did anyway
+  local rm_run_obj
+  for rm_run_obj in /run/*; do
+    if [ -e "${rm_run_obj}" ] && [ "${rm_run_obj}" != '/run/udev' ]; then
+      rm -rf "${rm_run_obj}"
+    fi
+  done
+
+  # locale configuration, lines may be in a nondeterministic order
+  [ -f /etc/locale.conf ] && LC_ALL=C sort -o /etc/locale.conf /etc/locale.conf
+
+  # our own grml-debootstrap configuration
+  rm -f /etc/debootstrap/config
 }
 # }}}
 
 # signal handler {{{
+# shellcheck disable=SC2329
 signal_handler() {
   finalize
   [ -n "$1" ] && EXIT="$1" || EXIT="1"
@@ -967,12 +1010,12 @@ trap signal_handler HUP INT QUIT TERM
  # always execute install_policy_rcd
  install_policy_rcd
 
- for i in markauto chrootmirror grmlrepos backportrepos kernelimg_conf \
+ for i in markauto chrootmirror grmlrepos backportrepos \
      kernel packages extrapackages reconfigure hosts \
      default_locales timezone fstab install_fs_tools hostname \
      initrd grub_install passwords \
-     custom_scripts upgrade_system remove_apt_cache services \
-     remove_chrootmirror; do
+     custom_scripts upgrade_system rpi_cmdline remove_apt_cache services \
+     remove_chrootmirror reproducible_finalize; do
      if stage "$i" ; then
        "$i"
        stage "$i" 'done'
