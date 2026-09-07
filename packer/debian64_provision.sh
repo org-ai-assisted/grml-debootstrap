@@ -60,7 +60,7 @@ virtualbox_setup() {
   mountpoint "${TARGET}/media/cdrom" >/dev/null && umount "${TARGET}/media/cdrom"
   mount -t iso9660 $isofile "${TARGET}/media/cdrom/"
   UTS_RELEASE=$KERNELVERSION LD_PRELOAD=/tmp/fake-uname.so grml-chroot "$TARGET" /media/cdrom/VBoxLinuxAdditions.run --nox11 || true
-  if grep -q "make: .*vboxguest.*Error 2" "${TARGET}/var/log/vboxadd-install.log" ; then
+  if grep --quiet "make: .*vboxguest.*Error 2" "${TARGET}/var/log/vboxadd-install.log" ; then
     echo "Error: looks like a fatal error happened during installation of VirtualBox Guest Additions." >&2
     exit 1
   fi
@@ -112,7 +112,7 @@ vagrant_setup() {
   chmod 0440 "${TARGET}/etc/sudoers.d/vagrant"
 
   host="$(cat ${TARGET}/etc/hostname)"
-  if ! grep -q "${host}$" "${TARGET}"/etc/hosts ; then
+  if ! grep --quiet "${host}$" "${TARGET}"/etc/hosts ; then
     echo "* Setting up localhost entry for hostname $host in /etc/hosts"
     cat >> "${TARGET}"/etc/hosts << EOF
 # Added by grml-debootstrap/provision to make sure host is resolvable for sudo:
@@ -124,7 +124,7 @@ EOF
   echo "* Setting up stdin/tty workaround in /root/.profile"
   sed -i "s;^mesg n$;# modified via grml-debootstrap/provision script to work around stdin/tty issue:\ntty -s \&\& mesg n;g" "${TARGET}"/root/.profile
 
-  if [ -f ${TARGET}/etc/ssh/sshd_config ] && ! grep -q '^UseDNS' ${TARGET}/etc/ssh/sshd_config ; then
+  if [ -f ${TARGET}/etc/ssh/sshd_config ] && ! grep --quiet '^UseDNS' ${TARGET}/etc/ssh/sshd_config ; then
     echo "* Disabling UseDNS in sshd config"
     echo "UseDNS no" >> ${TARGET}/etc/ssh/sshd_config
   fi
@@ -152,9 +152,12 @@ EOF
 sources_list_setup() {
   # This is ugly because it's 'testing' no matter what ISO we're using, but otherwise we're running into
   # W: Failed to fetch http://snapshot.debian.org/archive/debian/20141114/dists/testing/main/binary-amd64/Packages  404  Not Found [IP: 193.62.202.30 80]
-  echo "* Setting up /etc/apt/sources.list.d/debian.list to avoid snapshot.debian.org usage causing possible failures"
-  cat > /etc/apt/sources.list.d/debian.list << EOF
-deb http://ftp.debian.org/debian testing main
+  echo "* Setting up /etc/apt/sources.list.d/debian.sources to avoid snapshot.debian.org usage causing possible failures"
+  cat > /etc/apt/sources.list.d/debian.sources << EOF
+Types: deb
+URIs: http://ftp.debian.org/debian
+Suites: testing
+Components: main
 EOF
 }
 
@@ -163,8 +166,11 @@ grml_debootstrap_setup() {
   if [ "$GRML_DEBOOTSTRAP_VERSION" = "latest" ] ; then
     echo "** GRML_DEBOOTSTRAP_VERSION is set to '$GRML_DEBOOTSTRAP_VERSION'"
     echo "** Setting up grml-debootstrap from CI repository from jenkins.grml.org"
-    cat > /etc/apt/sources.list.d/grml-debootstrap.list << EOF
-deb     http://jenkins.grml.org/debian grml-debootstrap main
+    cat > /etc/apt/sources.list.d/grml-debootstrap.sources << EOF
+Types: deb
+URIs: http://jenkins.grml.org/debian
+Suites: grml-debootstrap
+Components: main
 EOF
     wget -O - http://jenkins.grml.org/debian/C525F56752D4A654.asc | apt-key add -
     apt-get update

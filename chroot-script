@@ -34,7 +34,7 @@ bash -n /etc/debootstrap/variables
 . /etc/debootstrap/variables || exit 1
 
 # Make sure all tools see SOURCE_DATE_EPOCH if it's available
-[ -n "${SOURCE_DATE_EPOCH:-}" ] && export SOURCE_DATE_EPOCH
+[ -v SOURCE_DATE_EPOCH ] && export SOURCE_DATE_EPOCH
 
 [ -r /proc/1 ] || mount -t proc none /proc
 [ -r /sys/kernel ] || mount -t sysfs none /sys
@@ -68,7 +68,7 @@ stage() {
   if [ -n "$2" ] ; then
      echo "$2" > "$STAGES/$1"
      return 0
-  elif grep -q 'done' "$STAGES/$1" 2>/dev/null ; then
+  elif grep --quiet 'done' "$STAGES/$1" 2>/dev/null ; then
      echo "   [*] Notice: stage $1 has been executed already, skipping execution therefore.">&2
      return 1
   fi
@@ -98,7 +98,7 @@ markauto() {
 
 # write a deb822 sources stanza to a file {{{
 writesource() {
-  local file types uris suites components signed_by
+  local file types uris suites components signed_by check_valid_until
 
   file="${1:-}"
   types="${2:-}"
@@ -106,6 +106,7 @@ writesource() {
   suites="${4:-}"
   components="${5:-}"
   signed_by="${6:-}"
+  check_valid_until="${7:-}"
 
   mkdir -p "$(dirname "${file}")"
 
@@ -121,12 +122,19 @@ writesource() {
   if [ -n "$signed_by" ]; then
     echo "Signed-By: $signed_by" >> "$file"
   fi
+  if [ -n "$check_valid_until" ]; then
+    echo "Check-Valid-Until: $check_valid_until" >> "$file"
+  fi
 }
 # }}}
 
 # define chroot mirror {{{
 # shellcheck disable=SC2329
 chrootmirror() {
+  local omit_check_valid_until check_valid_until
+  omit_check_valid_until="${1:-}"
+  check_valid_until=''
+
   if [ "$KEEP_SRC_LIST" = "yes" ] ; then
     echo "KEEP_SRC_LIST has been enabled, skipping chrootmirror stage."
     return
@@ -137,26 +145,34 @@ chrootmirror() {
   fi
   echo "Using repository components $COMPONENTS"
 
+  [ -v SOURCE_DATE_EPOCH ] && [ -z "${omit_check_valid_until}" ] \
+    && check_valid_until='no'
+
   if [ -n "$MIRROR" ] ; then
     echo "Deleting obsolete sources.list"
     rm -f /etc/apt/sources.list
 
-    if grep -q 'file:' <<< "$MIRROR" ; then
+    if grep --quiet 'file:' <<< "$MIRROR" ; then
       echo "Adjusting sources.list.d/local.sources for mirror (${MIRROR})."
-      writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+      writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
     else
       echo "Adjusting sources.list.d/debian.sources for mirror (${MIRROR})."
-      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
     fi
   fi
 
-  # add security.debian.org:
+  # add security mirror:
   case "$RELEASE" in
     unstable|sid) ;;  # no security pool available
     *)
       # https://lists.debian.org/debian-devel-announce/2019/07/msg00004.html
-      echo "Adding security.debian.org/debian-security to sources.list.d/debian.sources."
-      writesource '/etc/apt/sources.list.d/debian.sources' 'deb' 'http://security.debian.org/debian-security' "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+      if grep --quiet 'file:' <<< "$SECURITY_MIRROR" ; then
+        echo "Adding security mirror to sources.list.d/local.sources."
+        writesource '/etc/apt/sources.list.d/local.sources' 'deb' "$SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+      else
+        echo "Adding security mirror to sources.list.d/debian.sources."
+        writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
+      fi
       ;;
   esac
 }
@@ -170,11 +186,18 @@ remove_chrootmirror() {
     return
   fi
 
-  if [ -n "$MIRROR" ] && echo "$MIRROR" | grep -q 'file:' ; then
+  if [ -n "$MIRROR" ] && echo "$MIRROR" | grep --quiet 'file:' ; then
     echo "Removing local.sources."
-    rm /etc/apt/sources.list.d/local.sources
+    rm -f /etc/apt/sources.list.d/local.sources
     echo "Adding fallback mirror entry (${FALLBACK_MIRROR}) to sources.list.d/debian.sources instead."
     writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FALLBACK_MIRROR" "$RELEASE" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
+  fi
+
+  if [ -n "$SECURITY_MIRROR" ] && echo "$SECURITY_MIRROR" | grep --quiet 'file:' ; then
+    echo "Removing local.sources if necessary."
+    rm -rf /etc/apt/sources.list.d/local.sources
+    echo "Adding fallback security mirror entry (${FALLBACK_SECURITY_MIRROR}) to sources.list.d/debian.sources instead."
+    writesource '/etc/apt/sources.list.d/debian.sources' 'deb' "$FALLBACK_SECURITY_MIRROR" "${RELEASE}-security" "$COMPONENTS" '/usr/share/keyrings/debian-archive-keyring.gpg'
   fi
 }
 # }}}
@@ -226,8 +249,13 @@ EOF
 # shellcheck disable=SC2329
 backportrepos() {
   if [ -n "$BACKPORTREPOS" ] ; then
+    local omit_check_valid_until check_valid_until
+    omit_check_valid_until="${1:-}"
+    check_valid_until=''
+    [ -v SOURCE_DATE_EPOCH ] && [ -z "${omit_check_valid_until}" ] \
+      && check_valid_until='no'
     echo "# debian backports: ${RELEASE}-backports repository:" >> /etc/apt/sources.list.d/backports.sources
-    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg'
+    writesource '/etc/apt/sources.list.d/backports.sources' 'deb deb-src' "$MIRROR" "${RELEASE}-backports" 'main' '/usr/share/keyrings/debian-archive-keyring.gpg' "${check_valid_until}"
   fi
 }
 # }}}
@@ -390,7 +418,7 @@ rpi_cmdline() {
 reconfigure() {
   if [ -n "$RECONFIGURE" ] ; then
      for package in $RECONFIGURE ; do
-         if dpkg --list "$package" 2>/dev/null | grep -q '^ii' ; then
+         if dpkg --list "$package" 2>/dev/null | grep --quiet '^ii' ; then
            DEBIAN_FRONTEND=$DEBIAN_FRONTEND dpkg-reconfigure "$package" || \
            echo "Warning: $package does not exist, can not reconfigure it."
          fi
@@ -568,7 +596,7 @@ EOF
 # shellcheck disable=SC2329
 fstab() {
   # set up /etc/fstab if file is UNCONFIGURED (debootstrap, mmdebstrap)
-  if grep -q UNCONFIGURED /etc/fstab ; then
+  if grep --quiet UNCONFIGURED /etc/fstab ; then
      createfstab
   fi
 }
@@ -590,7 +618,7 @@ install_fs_tools() {
       ;;
   esac
 
-  if [ -n "${pkg:-}" ] && ! dpkg --list "${pkg}" 2>/dev/null | grep -q '^ii' ; then
+  if [ -n "${pkg:-}" ] && ! dpkg --list "${pkg}" 2>/dev/null | grep --quiet '^ii' ; then
     echo "Filesystem package ${pkg} not present, installing now"
     DEBIAN_FRONTEND=$DEBIAN_FRONTEND $APTINSTALL "${pkg}"
   fi
@@ -611,7 +639,7 @@ hostname() {
 
         # listen on loopback interface only:
         sed -i "s/^inet_interfaces = .*/inet_interfaces = loopback-only/" /etc/postfix/main.cf
-        grep -q inet_interfaces /etc/postfix/main.cf || echo 'inet_interfaces = loopback-only' >> /etc/postfix/main.cf
+        grep --quiet inet_interfaces /etc/postfix/main.cf || echo 'inet_interfaces = loopback-only' >> /etc/postfix/main.cf
      fi
      if [ -r /etc/mailname ] ; then
         # adjust /etc/mailname
@@ -665,7 +693,7 @@ efi_setup() {
     return 0
   fi
 
-  if ! dpkg --list efibootmgr 2>/dev/null | grep -q '^ii' ; then
+  if ! dpkg --list efibootmgr 2>/dev/null | grep --quiet '^ii' ; then
     echo "Notice: efi option set but no efibootmgr package, installing it therefore."
     DEBIAN_FRONTEND=$DEBIAN_FRONTEND $APTINSTALL efibootmgr
   fi
@@ -736,7 +764,7 @@ is_grub_bios_compatible() {
     # Scanning the output of lsblk is unreliable in some environments. partx
     # seems to work better.
     local partx_types
-    partx_types="$(partx --show --noheadings --output TYPE "$GRUB")"
+    partx_types="$(partx --show --noheadings --output TYPE "$GRUB")" || true
     if [[ "${partx_types}" \
       =~ (^|$'\n')21686148-6449-6e6f-744e-656564454649($'\n'|$) ]]; then
       return 0
@@ -906,6 +934,24 @@ finalize() {
 reproducible_finalize() {
   [ -v SOURCE_DATE_EPOCH ] || return 0
   echo "Applying reproducible-build finalization."
+
+  # Regenerate apt sources with their final values.
+  if [ -n "${FINAL_MIRROR}" ]; then
+    MIRROR="${FINAL_MIRROR}"
+  fi
+  if [ -n "${FINAL_SECURITY_MIRROR}" ]; then
+    SECURITY_MIRROR="${FINAL_SECURITY_MIRROR}"
+  fi
+  rm -f '/etc/apt/sources.list.d/debian.sources'
+  rm -f '/etc/apt/sources.list.d/backports.sources'
+  chrootmirror 'omit-check-valid-until'
+  backportrepos 'omit-check-valid-until'
+  remove_chrootmirror
+
+  # stale apt repository information
+  find /var/lib/apt/lists -mindepth 1 -maxdepth 1 -type f -delete
+  find /var/lib/apt/lists/auxfiles -mindepth 1 -maxdepth 1 -type f -delete
+  find /var/lib/apt/lists/partial -mindepth 1 -maxdepth 1 -type f -delete
 
   # SSH host keys
   rm -f /etc/ssh/ssh_host_*

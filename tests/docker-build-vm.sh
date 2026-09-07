@@ -18,7 +18,12 @@ TARGET="$4"
 
 set -x
 
-MIRROR='https://deb.debian.org/debian'
+# Honour a MIRROR passed in (e.g. a local apt cache via APT_CACHE_MIRROR); default to
+# the public mirror when empty/unset, so CI and normal runs are unchanged.
+# A reproducible build (SOURCE_DATE_EPOCH set) ignores this and installs from
+# SNAPSHOT_ARCHIVE, which grml-debootstrap reads straight from the environment;
+# MIRROR is then only what the built system ends up pointing at.
+MIRROR="${MIRROR:-https://deb.debian.org/debian}"
 
 
 echo " ****************************************************************** "
@@ -28,6 +33,12 @@ if [ "$TARGET" = 'RPI' ]; then
   extra_buildopts=(--rpifile --non-free)
 else
   extra_buildopts=(--vmfile)
+  # VMEFI=1 builds a GPT image with an ESP + bios_grub partition (grub-cloud +
+  # signed shim/grub), so the same image is bootable on BIOS, UEFI and UEFI+Secure
+  # Boot -- required for the 3-firmware boot test (tests/firmware-boot-test.sh).
+  if [ "${VMEFI:-}" = '1' ] && [ "$(dpkg --print-architecture)" = 'amd64' ]; then
+    extra_buildopts+=(--vmefi)
+  fi
 fi
 
 # arm64 'virt' machines expose a pl011 UART as ttyAMA0 with no VGA console;

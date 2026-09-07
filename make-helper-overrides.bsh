@@ -1,0 +1,11 @@
+#!/bin/bash
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## style-ok: no-strict -- SOURCED by genmkfile's make-helper-one.bsh, not executed.
+## A strict-mode block here would change the CALLER's shell options, and the
+## sibling overrides (grml-debootstraptest/, debian/) carry none either.
+
+## This repo has no debian/control by design.
+make_use_git_describe_for_version=true

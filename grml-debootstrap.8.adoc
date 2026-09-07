@@ -310,6 +310,46 @@ WARNING: the command line parsing of grml-debootstrap usually does not validate
 the provided arguments for the command line options. Please be careful and check
 docs and /etc/debootstrap/config for further information.
 
+Reproducible builds
+-------------------
+
+grml-debootstrap can build bit-for-bit reproducible Virtual Machine images
+(*--vm* / *--vmfile*). Reproducible builds are enabled solely by exporting
+*SOURCE_DATE_EPOCH*, the tool-agnostic switch used across the reproducible-builds
+ecosystem; there is no separate on/off flag. Set it to a decimal integer in the
+range (0, INT64_MAX):
+
+  SOURCE_DATE_EPOCH=1767225600 grml-debootstrap --vmfile \
+    --target /tmp/disk.img --release trixie
+
+Disk and filesystem identifiers, the filesystem block layout and all embedded
+timestamps are then derived deterministically from it, so two builds with the same
+SOURCE_DATE_EPOCH and inputs produce byte-identical images. Leave SOURCE_DATE_EPOCH
+unset for a normal, non-reproducible build. A set but malformed value is a hard
+error rather than a silently non-reproducible build. Reproducible EFI images
+additionally require the *mtools* package, and reproducible builds require
+*e2fsprogs* >= 1.47.1 (mke2fs SOURCE_DATE_EPOCH support).
+
+The package set is pinned as well. A reproducible build ignores both the default
+mirror and *--mirror* and installs from the snapshot.debian.org archive as it stood
+at SOURCE_DATE_EPOCH, so the same SOURCE_DATE_EPOCH keeps selecting the same package
+versions as the Debian archive moves on. The configured mirror is written into the
+installed system at the end of the build, so the resulting image tracks a real
+mirror and not the snapshot. Set *SNAPSHOT_ARCHIVE* to use a local snapshot mirror
+instead of snapshot.debian.org.
+
+WARNING: enabling reproducible builds introduces a security risk when a root
+password is specified and relied upon for security. The root password is hashed
+with the fixed salt *ROOTPASSWORD_SALT*; when ROOTPASSWORD_SALT is unset the salt is
+derived from SOURCE_DATE_EPOCH instead. That means anyone, anywhere, who builds an
+image with the same SOURCE_DATE_EPOCH uses the same salt to hash their root password
+as every other such user, and building several images that share a SOURCE_DATE_EPOCH
+reuses the salt across them. This is not a problem in most scenarios but may be in
+some. Users who consider it a problem must not use reproducible builds, or must set
+*ROOTPASSWORD_SALT* to a fixed but initially randomly generated value.
+grml-debootstrap logs a warning at build time when SOURCE_DATE_EPOCH is set but
+ROOTPASSWORD_SALT is not.
+
 Networking
 ----------
 
