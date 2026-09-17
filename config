@@ -47,6 +47,10 @@
 # Usage example:
 # MIRROR='ftp://ftp.de.debian.org/debian'
 
+# Archive to install from during reproducible builds.
+# Default: 'https://snapshot.debian.org/archive'
+# SNAPSHOT_ARCHIVE='https://snapshot.debian.org/archive'
+
 # Set mirror where security updates will be downloaded from.
 # Default: http://security.debian.org/debian-security
 # SECURITY_MIRROR='http://security.debian.org/debian-security'
