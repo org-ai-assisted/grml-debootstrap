@@ -8,11 +8,18 @@ permissions:
   actions: read
   contents: read
   pull-requests: write
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
 jobs:
   build-debian:
+    if: vars.CI_ENABLED_ORG_AI_ASSISTED == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: "Update changelog"
         run: |
           set -ex
@@ -30,9 +37,9 @@ jobs:
 
            -- Automated Build <builder@localhost>  $(date -R)
           EOT
-      - uses: jtdor/build-deb-action@v1
+      - uses: jtdor/build-deb-action@473136f14a42a231124c1f7cefaedfe941203c38  # v1.9.1
       - name: Archive build result
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: packages
           if-no-files-found: error
@@ -43,7 +50,7 @@ jobs:
       - name: Comment PR with artifact link
         if: github.event_name == 'pull_request'
         continue-on-error: true
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             const runId = context.runId;
